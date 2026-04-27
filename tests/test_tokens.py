@@ -445,5 +445,54 @@ class TestCalibrateRatio(unittest.TestCase):
         self.assertIsNone(ratio)
 
 
+class TestEnvVarOverrideValidation(unittest.TestCase):
+    """Env var override parsing must reject nonsensical values instead of
+    silently ignoring (previous falsy-trap bug with `if val:`) or propagating
+    them into token-math divisions producing negative percentages."""
+
+    def _get_window(self):
+        from cozempic.tokens import get_context_window_override
+        return get_context_window_override()
+
+    def _get_overhead(self):
+        from cozempic.tokens import get_system_overhead_tokens
+        return get_system_overhead_tokens()
+
+    def test_zero_context_window_was_falsy_trap_now_rejected(self):
+        """COZEMPIC_CONTEXT_WINDOW=0 was silently swallowed by the old
+        `if val:` check. Now returns None (plus a warning) so the caller
+        falls back to model-based detection."""
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COZEMPIC_CONTEXT_WINDOW": "0"}):
+            self.assertIsNone(self._get_window())
+
+    def test_negative_context_window_rejected(self):
+        """Previously returned -100, producing context_pct=-110%."""
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COZEMPIC_CONTEXT_WINDOW": "-100"}):
+            self.assertIsNone(self._get_window())
+
+    def test_valid_context_window_override(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COZEMPIC_CONTEXT_WINDOW": "200000"}):
+            self.assertEqual(self._get_window(), 200000)
+
+    def test_system_overhead_accepts_zero(self):
+        """0 is valid here — a session with no rules/MCP has no overhead."""
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COZEMPIC_SYSTEM_OVERHEAD_TOKENS": "0"}):
+            self.assertEqual(self._get_overhead(), 0)
+
+    def test_system_overhead_rejects_negative(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COZEMPIC_SYSTEM_OVERHEAD_TOKENS": "-50"}):
+            self.assertEqual(self._get_overhead(), SYSTEM_OVERHEAD_TOKENS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,38 @@ from .types import PrescriptionResult, StrategyResult
 # Ensure all strategies are registered
 import cozempic.strategies  # noqa: F401
 
+
+# ─── argparse type= validators ────────────────────────────────────────────
+# Kept inline (not a separate module) because they're tiny and argparse-specific.
+# Raise argparse.ArgumentTypeError so the error surfaces as a standard
+# argparse validation error — user sees "error: argument --threshold:
+# must be positive, got -1" with correct exit code 2.
+
+
+def _positive_int(val: str) -> int:
+    """argparse type= for strictly-positive ints. Used for --interval,
+    --threshold-tokens, and --soft-threshold-tokens where zero is
+    nonsensical (spin loops, always-trigger thresholds)."""
+    try:
+        n = int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{val!r} is not a valid integer")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {n}")
+    return n
+
+
+def _positive_float(val: str) -> float:
+    """argparse type= for strictly-positive floats. Used for --threshold
+    and --soft-threshold (MB thresholds)."""
+    try:
+        f = float(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{val!r} is not a valid number")
+    if f <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {f}")
+    return f
+
 # Fix Windows stdout/stderr encoding for Unicode characters (box-drawing, emoji)
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1047,11 +1079,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard = sub.add_parser("guard", help="Background sentinel — auto-prune before compaction triggers")
     p_guard.add_argument("--cwd", help="Working directory (default: current)")
     p_guard.add_argument("-rx", help="Prescription to apply (default: standard)")
-    p_guard.add_argument("--threshold", type=float, default=50.0, help="Hard threshold in MB — full prune + reload (default: 50)")
-    p_guard.add_argument("--soft-threshold", type=float, default=None, help="Soft threshold in MB — gentle prune, no reload (default: 60%% of --threshold)")
-    p_guard.add_argument("--interval", type=int, default=30, help="Check interval in seconds (default: 30)")
-    p_guard.add_argument("--threshold-tokens", type=int, default=None, help="Hard threshold in tokens (default: 75%% of context window)")
-    p_guard.add_argument("--soft-threshold-tokens", type=int, default=None, help="Soft threshold in tokens (default: 45%% of context window)")
+    p_guard.add_argument("--threshold", type=_positive_float, default=50.0, help="Hard threshold in MB — full prune + reload (default: 50)")
+    p_guard.add_argument("--soft-threshold", type=_positive_float, default=None, help="Soft threshold in MB — gentle prune, no reload (default: 60%% of --threshold)")
+    p_guard.add_argument("--interval", type=_positive_int, default=30, help="Check interval in seconds (default: 30)")
+    p_guard.add_argument("--threshold-tokens", type=_positive_int, default=None, help="Hard threshold in tokens (default: 75%% of context window)")
+    p_guard.add_argument("--soft-threshold-tokens", type=_positive_int, default=None, help="Soft threshold in tokens (default: 45%% of context window)")
     p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
     p_guard.add_argument("--no-reactive", action="store_true", help="Disable reactive overflow recovery (kqueue/polling watcher)")
     p_guard.add_argument("--daemon", action="store_true", help="Run in background (PID file prevents double-starts)")
@@ -1083,7 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # remind
     p_remind = sub.add_parser("remind", help="Output active behavioral rules (for PostToolUse hook)")
-    p_remind.add_argument("--interval", type=int, default=25, help="Output every N tool calls (default: 25)")
+    p_remind.add_argument("--interval", type=_positive_int, default=25, help="Output every N tool calls (default: 25)")
 
     # digest
     p_digest = sub.add_parser("digest", help="Manage behavioral correction rules")
