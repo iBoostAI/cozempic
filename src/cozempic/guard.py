@@ -1023,9 +1023,33 @@ def start_guard_daemon(
     Spawns a detached subprocess running `cozempic guard` with output
     redirected to a log file. Uses a PID file to prevent double-starts.
 
+    Pre-validates numeric parameters before spawning the child process.
+    Without this, bad values (negative thresholds, zero intervals) would
+    pass to the child via CLI args, be accepted by argparse (which only
+    runs in the child), and cause the child to die immediately — while
+    the caller sees started=True.
+
     Returns dict with: started (bool), pid (int|None), pid_file, log_file,
     already_running (bool).
     """
+    from ._validation import ConfigError
+
+    if threshold_mb is not None and threshold_mb <= 0:
+        raise ConfigError(f"threshold_mb must be positive, got {threshold_mb}")
+    if soft_threshold_mb is not None and soft_threshold_mb <= 0:
+        raise ConfigError(f"soft_threshold_mb must be positive, got {soft_threshold_mb}")
+    if soft_threshold_mb is not None and threshold_mb is not None and soft_threshold_mb >= threshold_mb:
+        raise ConfigError(
+            f"soft_threshold_mb ({soft_threshold_mb}) must be strictly less than "
+            f"threshold_mb ({threshold_mb})"
+        )
+    if interval is not None and interval <= 0:
+        raise ConfigError(f"interval must be positive, got {interval}")
+    if threshold_tokens is not None and threshold_tokens <= 0:
+        raise ConfigError(f"threshold_tokens must be positive, got {threshold_tokens}")
+    if soft_threshold_tokens is not None and soft_threshold_tokens <= 0:
+        raise ConfigError(f"soft_threshold_tokens must be positive, got {soft_threshold_tokens}")
+
     cwd = cwd or os.getcwd()
 
     # Migrate: clean up legacy CWD-keyed PID files from pre-1.6.13
