@@ -24,6 +24,7 @@ import sys
 import time
 from pathlib import Path
 
+from ._validation import ConfigError
 from .executor import run_prescription
 from .helpers import is_ssh_session, shell_quote
 from .registry import PRESCRIPTIONS
@@ -246,6 +247,38 @@ def start_guard(
         soft_threshold_tokens: Soft threshold in tokens (optional, checked alongside bytes).
         session_id: Explicit session ID to monitor (bypasses auto-detection).
     """
+    # Validate ordering invariants FIRST — a reload storm caused by a
+    # swapped soft/hard threshold is much worse than a clean upfront error.
+    # Argparse already rejects non-positive values, but direct Python callers
+    # (guard.start_guard(...)) bypass argparse, so belt-and-braces check.
+    if threshold_mb <= 0:
+        raise ConfigError(f"threshold_mb must be positive, got {threshold_mb}")
+    if soft_threshold_mb is not None and soft_threshold_mb <= 0:
+        raise ConfigError(f"soft_threshold_mb must be positive, got {soft_threshold_mb}")
+    if (
+        soft_threshold_mb is not None
+        and soft_threshold_mb >= threshold_mb
+    ):
+        raise ConfigError(
+            f"soft_threshold_mb={soft_threshold_mb} must be strictly less than "
+            f"threshold_mb={threshold_mb}"
+        )
+    if interval <= 0:
+        raise ConfigError(f"interval must be positive, got {interval}")
+    if threshold_tokens is not None and threshold_tokens <= 0:
+        raise ConfigError(f"threshold_tokens must be positive, got {threshold_tokens}")
+    if soft_threshold_tokens is not None and soft_threshold_tokens <= 0:
+        raise ConfigError(f"soft_threshold_tokens must be positive, got {soft_threshold_tokens}")
+    if (
+        threshold_tokens is not None
+        and soft_threshold_tokens is not None
+        and soft_threshold_tokens >= threshold_tokens
+    ):
+        raise ConfigError(
+            f"soft_threshold_tokens={soft_threshold_tokens} must be strictly less than "
+            f"threshold_tokens={threshold_tokens}"
+        )
+
     hard_threshold_bytes = int(threshold_mb * 1024 * 1024)
 
     if soft_threshold_mb is None:

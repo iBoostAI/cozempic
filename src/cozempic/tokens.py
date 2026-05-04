@@ -33,13 +33,10 @@ def get_system_overhead_tokens() -> int:
     conservative for lightweight sessions. Override with
     COZEMPIC_SYSTEM_OVERHEAD_TOKENS env var or --system-overhead-tokens flag.
     """
-    import os
-    val = os.environ.get("COZEMPIC_SYSTEM_OVERHEAD_TOKENS")
-    if val:
-        try:
-            return int(val)
-        except ValueError:
-            pass
+    from ._validation import parse_env_non_negative_int
+    override = parse_env_non_negative_int("COZEMPIC_SYSTEM_OVERHEAD_TOKENS")
+    if override is not None:
+        return override
     return SYSTEM_OVERHEAD_TOKENS
 
 
@@ -91,15 +88,16 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 
 
 def get_context_window_override() -> int | None:
-    """Check for user override via COZEMPIC_CONTEXT_WINDOW env var."""
-    import os
-    val = os.environ.get("COZEMPIC_CONTEXT_WINDOW")
-    if val:
-        try:
-            return int(val)
-        except ValueError:
-            pass
-    return None
+    """Check for user override via COZEMPIC_CONTEXT_WINDOW env var.
+
+    Requires a strictly-positive integer. Zero previously hit the
+    `if val:` falsy-trap and was silently ignored; negative values
+    propagated into `context_pct = total / cw` producing negative
+    percentages. Both now emit a stderr warning and fall back to None
+    (triggering model-based detection at detect_context_window).
+    """
+    from ._validation import parse_env_positive_int
+    return parse_env_positive_int("COZEMPIC_CONTEXT_WINDOW")
 
 # Chars-per-token defaults (conservative)
 CHARS_PER_TOKEN_CODE = 3.5

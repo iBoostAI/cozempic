@@ -61,6 +61,144 @@ class TestPrescanArgvValidation:
             assert "COZEMPIC_CONTEXT_WINDOW" not in os.environ
 
 
+class TestGuardArgparseValidation:
+    """`cozempic guard` numeric flags must reject nonsensical values at
+    parse time rather than silently triggering a reload storm or crashing
+    deep in `time.sleep(interval)` on the first cycle."""
+
+    def _parse(self, argv):
+        parser = build_parser()
+        return parser.parse_args(argv)
+
+    def _assert_argparse_rejects(self, argv, match_stderr=None):
+        import io
+        import contextlib
+        parser = build_parser()
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                parser.parse_args(argv)
+            except SystemExit as e:
+                assert e.code == 2, f"expected exit code 2, got {e.code}"
+                if match_stderr:
+                    assert match_stderr in buf.getvalue(), (
+                        f"expected {match_stderr!r} in stderr, got: {buf.getvalue()!r}"
+                    )
+                return
+        raise AssertionError(f"argparse accepted {argv!r} but should have rejected")
+
+    def test_threshold_rejects_zero(self):
+        self._assert_argparse_rejects(
+            ["guard", "--threshold", "0"], match_stderr="positive"
+        )
+
+    def test_threshold_rejects_negative(self):
+        self._assert_argparse_rejects(
+            ["guard", "--threshold", "-1"], match_stderr="positive"
+        )
+
+    def test_threshold_rejects_non_numeric(self):
+        self._assert_argparse_rejects(["guard", "--threshold", "abc"])
+
+    def test_threshold_accepts_valid_float(self):
+        args = self._parse(["guard", "--threshold", "50.5"])
+        assert args.threshold == 50.5
+
+    def test_threshold_accepts_int(self):
+        """User may write `--threshold 50` (int) — accept."""
+        args = self._parse(["guard", "--threshold", "50"])
+        assert args.threshold == 50.0
+
+    def test_soft_threshold_rejects_zero(self):
+        self._assert_argparse_rejects(["guard", "--soft-threshold", "0"])
+
+    def test_soft_threshold_rejects_negative(self):
+        self._assert_argparse_rejects(["guard", "--soft-threshold", "-1"])
+
+    def test_interval_rejects_zero(self):
+        """interval=0 → spin loop (guard cycles with no pause)."""
+        self._assert_argparse_rejects(
+            ["guard", "--interval", "0"], match_stderr="positive"
+        )
+
+    def test_interval_rejects_negative(self):
+        """interval=-1 → ValueError from time.sleep(-1) mid-daemon."""
+        self._assert_argparse_rejects(["guard", "--interval", "-1"])
+
+    def test_interval_accepts_valid(self):
+        args = self._parse(["guard", "--interval", "30"])
+        assert args.interval == 30
+
+    def test_threshold_tokens_rejects_zero(self):
+        self._assert_argparse_rejects(["guard", "--threshold-tokens", "0"])
+
+    def test_threshold_tokens_rejects_negative(self):
+        self._assert_argparse_rejects(["guard", "--threshold-tokens", "-100"])
+
+    def test_soft_threshold_tokens_rejects_zero(self):
+        self._assert_argparse_rejects(["guard", "--soft-threshold-tokens", "0"])
+
+    def test_soft_threshold_tokens_rejects_negative(self):
+        self._assert_argparse_rejects(["guard", "--soft-threshold-tokens", "-1"])
+
+    def test_remind_interval_rejects_zero(self):
+        """Separate `--interval` on `cozempic remind` — same validation."""
+        self._assert_argparse_rejects(["remind", "--interval", "0"])
+
+    def test_remind_interval_rejects_negative(self):
+        self._assert_argparse_rejects(["remind", "--interval", "-5"])
+
+
+class TestStartGuardOrderingValidation:
+    """After argparse, soft thresholds may be resolved from defaults
+    (60% of threshold). The soft < hard invariant must hold at that point
+    too — checked inside start_guard, not just at argparse."""
+
+    def _call_start_guard(self, **kwargs):
+        from cozempic.guard import start_guard
+        return start_guard(**kwargs)
+
+    def test_soft_mb_equal_hard_mb_rejected(self):
+        from cozempic._validation import ConfigError
+        with self.assertRaisesLike(ConfigError, "strictly less"):
+            self._call_start_guard(
+                threshold_mb=50.0,
+                soft_threshold_mb=50.0,
+                cwd="/tmp/_cozempic_test_nonexistent_session",
+            )
+
+    def test_soft_mb_greater_than_hard_mb_rejected(self):
+        from cozempic._validation import ConfigError
+        with self.assertRaisesLike(ConfigError, "strictly less"):
+            self._call_start_guard(
+                threshold_mb=50.0,
+                soft_threshold_mb=100.0,
+                cwd="/tmp/_cozempic_test_nonexistent_session",
+            )
+
+    def test_soft_tokens_greater_than_threshold_tokens_rejected(self):
+        from cozempic._validation import ConfigError
+        with self.assertRaisesLike(ConfigError, "strictly less"):
+            self._call_start_guard(
+                threshold_mb=50.0,
+                threshold_tokens=10_000,
+                soft_threshold_tokens=20_000,
+                cwd="/tmp/_cozempic_test_nonexistent_session",
+            )
+
+    # pytest-style: contextmanager mimic
+    from contextlib import contextmanager
+
+    @contextmanager
+    def assertRaisesLike(self, exc_type, substr):
+        try:
+            yield
+        except exc_type as e:
+            assert substr in str(e), f"expected {substr!r} in {e!r}"
+            return
+        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
+
+
 class TestReloadSessionFlag:
     """Reload must accept --session as an escape hatch when auto-detect fails."""
 
