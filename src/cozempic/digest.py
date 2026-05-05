@@ -135,20 +135,39 @@ _SYSTEM_NOISE_MARKERS = (
 )
 
 
+# Zero-width and format characters sometimes injected before tag brackets:
+# ZWSP (U+200B), ZWNJ (U+200C), ZWJ (U+200D), BOM (U+FEFF), WORD JOINER (U+2060),
+# LRM (U+200E), RLM (U+200F). `str.strip()` does NOT remove these by default.
+_ZERO_WIDTH_PREFIX_CHARS = ("​", "‌", "‍", "﻿", "⁠", "‎", "‏")
+
+# Unicode tag-bracket lookalikes — when they appear as the LEADING char of a
+# turn, the turn is a synthetic/wrapped emission, not a user correction.
+# Substring match would false-positive on genuine user text that happens to
+# quote a word with guillemets (« foo ») or fullwidth punctuation — so we
+# restrict to startswith.
+_UNICODE_TAG_LEAD_CHARS = ("＜", "«", "〈")  # ＜ « 〈
+
+
 def _is_system_noise(text: str) -> bool:
     """Return True if `text` is a Claude Code synthetic/framework turn.
 
-    Rejects: empty text, tag-wrapped blocks, slash-command lines, and known
-    framework prompt markers. Used to gate `extract_corrections` upstream of
-    `classify_turn` so synthetic turns never become behavioral rules.
+    Rejects: empty text, tag-wrapped blocks (ASCII `<` or Unicode lookalikes),
+    slash-command lines, and known framework prompt markers. Used to gate
+    `extract_corrections` upstream of `classify_turn` so synthetic turns
+    never become behavioral rules.
     """
     if not text:
         return True
-    stripped = text.strip()
+    # Strip standard whitespace AND zero-width format chars (A1 — some emitters
+    # inject ZWSP/BOM before the opening '<' which bypasses a plain strip()).
+    stripped = text.strip().lstrip("".join(_ZERO_WIDTH_PREFIX_CHARS))
     if not stripped:
         return True
     # Tag-like: any line starting with '<' is either synthetic or XML.
     if stripped.startswith("<"):
+        return True
+    # Unicode tag-bracket lookalikes as LEADING char (A1 — fullwidth ＜, «, 〈).
+    if stripped[0] in _UNICODE_TAG_LEAD_CHARS:
         return True
     # Slash command: '/' + lowercase letter (distinguish from file paths like /Users)
     if len(stripped) >= 2 and stripped[0] == "/" and stripped[1].islower():
