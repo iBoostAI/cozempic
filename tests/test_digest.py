@@ -1553,5 +1553,98 @@ class TestAtomicSave(unittest.TestCase):
                     f"(fcntl.flock) required to prevent lost-update.")
 
 
+class TestLoadDigestStoreHardening(unittest.TestCase):
+    """BUG-15 — load_digest_store must not crash on PermissionError / OSError."""
+
+    def test_load_returns_empty_store_on_permission_error(self):
+        """Corrupted perms or unreadable file → empty store, no crash."""
+        from cozempic.digest import load_digest_store
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_file.write_text("{}", encoding="utf-8")
+            real_read_text = Path.read_text
+
+            def denying_read_text(self, *args, **kwargs):
+                if str(self).endswith("behavioral-digest.json"):
+                    raise PermissionError("simulated EACCES")
+                return real_read_text(self, *args, **kwargs)
+
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch.object(Path, "read_text", denying_read_text):
+                store = load_digest_store("/test")
+                self.assertTrue(store.is_empty())
+
+    def test_load_returns_empty_store_on_oserror(self):
+        """Generic OSError (disk IO failure) → empty store, no crash."""
+        from cozempic.digest import load_digest_store
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_file.write_text("{}", encoding="utf-8")
+            real_read_text = Path.read_text
+
+            def broken_read_text(self, *args, **kwargs):
+                if str(self).endswith("behavioral-digest.json"):
+                    raise OSError("simulated disk IO error")
+                return real_read_text(self, *args, **kwargs)
+
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch.object(Path, "read_text", broken_read_text):
+                store = load_digest_store("/test")
+                self.assertTrue(store.is_empty())
+
+
+class TestSystemNoiseUnicodeMarkers(unittest.TestCase):
+    """A1 — `_is_system_noise` must catch Unicode tag lookalikes and zero-width prefixes."""
+
+    def test_rejects_fullwidth_angle_bracket(self):
+        """U+FF1C FULLWIDTH LESS-THAN SIGN (＜) used in some LLM tag emissions."""
+        is_noise = _import_system_noise()
+        self.assertTrue(is_noise("＜tool_call＞don't do X＜/tool_call＞"))
+
+    def test_rejects_guillemet_wrapped(self):
+        """French guillemets « » used as tag substitute by some models."""
+        is_noise = _import_system_noise()
+        self.assertTrue(is_noise("«command»don't do Y«/command»"))
+
+    def test_rejects_cjk_angle_bracket(self):
+        """CJK angle brackets 〈 〉 (U+3008/U+3009)."""
+        is_noise = _import_system_noise()
+        self.assertTrue(is_noise("〈system〉don't do Z〈/system〉"))
+
+    def test_rejects_zero_width_prefix_tag(self):
+        """ZWSP/BOM before '<' — Python's .strip() does NOT remove these by default."""
+        is_noise = _import_system_noise()
+        self.assertTrue(is_noise("​<system-reminder>don't do W</system-reminder>"))
+        self.assertTrue(is_noise("﻿<command-name>/init</command-name>"))
+
+    def test_accepts_genuine_correction_with_guillemet_quotes(self):
+        """False-positive check: guillemets around a word (not wrapping a tag) must pass."""
+        is_noise = _import_system_noise()
+        self.assertFalse(is_noise("don't use «Write» on existing files"))
+
+
+class TestMemdirConfigDirFallback(unittest.TestCase):
+    """A tightening of TestMemdirHonorsConfigDir — verify fallback path includes `.claude`
+    even when HOME is patched, by directly checking the returned path structure."""
+
+    def test_fallback_path_structure_when_env_unset(self):
+        """When CLAUDE_CONFIG_DIR is unset, _get_memdir must resolve a path ending in
+        `.claude/projects/<slug>/memory`. This is a structural check, not HOME-patching."""
+        import os
+        with tempfile.TemporaryDirectory() as fake_home:
+            projects_dir = Path(fake_home) / ".claude" / "projects" / "-test-cwd" / "memory"
+            projects_dir.mkdir(parents=True)
+
+            env = os.environ.copy()
+            env.pop("CLAUDE_CONFIG_DIR", None)
+
+            with patch.dict(os.environ, env, clear=True), \
+                 patch("pathlib.Path.home", return_value=Path(fake_home)):
+                result = _get_memdir("/test/cwd")
+                self.assertIsNotNone(result)
+                self.assertTrue(str(result).endswith(".claude/projects/-test-cwd/memory"),
+                                f"expected .claude/... suffix, got {result}")
+
+
 if __name__ == "__main__":
     unittest.main()
