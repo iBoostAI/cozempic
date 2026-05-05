@@ -664,12 +664,23 @@ def build_injection_text(store: DigestStore) -> str | None:
 
 
 def _get_memdir(cwd: str = "") -> Path | None:
-    """Find the Claude Code memory directory for the given project."""
+    """Find the Claude Code memory directory for the given project.
+
+    Honours `CLAUDE_CONFIG_DIR` env var (set by the `claudes` profile launcher)
+    before falling back to `~/.claude`. This prevents cross-profile leaks
+    where work-session digests land in the personal memdir.
+    """
+    import os
     if not cwd:
-        import os
         cwd = os.getcwd()
-    # Claude Code stores memories at ~/.claude/projects/<sanitized-cwd>/memory/
-    claude_dir = Path.home() / ".claude" / "projects"
+    # CC stores memories at $CLAUDE_CONFIG_DIR/projects/<slug>/memory (or
+    # ~/.claude/projects/<slug>/memory if the env var is not set).
+    config_dir_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir_env:
+        config_dir = Path(config_dir_env).expanduser()
+    else:
+        config_dir = Path.home() / ".claude"
+    claude_dir = config_dir / "projects"
     if not claude_dir.exists():
         return None
     # Sanitize cwd the same way CC does: replace / with -
