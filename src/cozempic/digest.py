@@ -277,8 +277,17 @@ def _to_prohibition(text: str) -> str:
     "Don't add X" → "Do not add X"
     "Stop doing X" → "Do not do X"
     "No, use Y instead" → "Do not use the previous approach; use Y instead"
+
+    Returns empty string (sentinel for "skip this candidate") when the input
+    is obviously structural/non-correction content: too long, multi-paragraph,
+    leading markdown, code fence, or tag.
     """
     text = text.strip()
+    # Reject structural / oversize input — cannot be a clean correction.
+    if not text or len(text) > 200 or text.count("\n") > 2:
+        return ""
+    if text[0] in "<-*#`":
+        return ""
     # Already in prohibition form
     if text.lower().startswith("do not ") or text.lower().startswith("don't "):
         return text[0].upper() + text[1:]
@@ -367,6 +376,10 @@ def extract_corrections(
         }
 
         rule_text = _to_prohibition(user_text)
+        if not rule_text:
+            # _to_prohibition rejected the input as structural/non-correction.
+            prev_assistant_text = ""
+            continue
         scope = _infer_scope(user_text)
 
         rule = DigestRule(
