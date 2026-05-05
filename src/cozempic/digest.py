@@ -395,8 +395,9 @@ def extract_corrections(
             importance=1,
             source_reliability=reliability_map.get(turn_class, 0.5),
             type_prior=type_prior_map.get(turn_class, 0.5),
-            # Explicit corrections are high-confidence — active immediately
-            status="active" if turn_class == "EXPLICIT_CORRECTION" else "pending",
+            # All new rules start pending — the repetition gate in admit_rule
+            # promotes them to active after PROMOTION_COUNT occurrences.
+            status="pending",
             occurrence_count=1,
             first_seen=now,
             last_reinforced=now,
