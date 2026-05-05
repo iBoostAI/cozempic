@@ -468,93 +468,95 @@ def _bigrams(text: str) -> set[str]:
     return {f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)}
 
 
+def _overlap(a: set, b: set) -> float:
+    """Jaccard-like overlap: shared / max(|a|, |b|). 0.0 on empty."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(len(a), len(b))
+
+
+def _is_match(new_words: set, new_bigrams: set, ex_words: set, ex_bigrams: set) -> bool:
+    """True if word AND bigram overlap both pass 0.5 threshold.
+
+    Bigram overlap distinguishes order-inverted rules like "use Edit not Write"
+    vs "use Write not Edit" which share bag-of-words but have opposite intent.
+    """
+    if _overlap(new_words, ex_words) <= 0.5:
+        return False
+    return _overlap(new_bigrams, ex_bigrams) >= 0.5
+
+
 def _find_duplicate(new_rule: DigestRule, store: DigestStore) -> DigestRule | None:
     """Find a semantically similar existing rule.
 
-    Merge rules only when BOTH:
-      - scope AND priority match (opposite-priority or cross-scope rules are
-        considered different instructions even if word sets overlap)
-      - word-set overlap > 0.75 AND bigram (word-order-sensitive) overlap > 0.5
-
-    Bigram overlap is required to distinguish order-inverted rules like
-    "use Edit not Write" vs "use Write not Edit" which share the same bag
-    of words but have opposite intent.
+    Requires scope AND priority match first (opposite-priority or cross-scope
+    rules are different instructions even if text overlaps), then both
+    word-overlap > 0.5 and bigram-overlap >= 0.5 on rule text OR on the
+    user-phrased evidence.
     """
     new_words = _normalize_for_match(new_rule.rule)
     if not new_words:
         return None
     new_bigrams = _bigrams(new_rule.rule)
-    new_evidence_words = _normalize_for_match(new_rule.evidence) if new_rule.evidence else set()
-    new_evidence_bigrams = _bigrams(new_rule.evidence) if new_rule.evidence else set()
+    new_ev_words = _normalize_for_match(new_rule.evidence) if new_rule.evidence else set()
+    new_ev_bigrams = _bigrams(new_rule.evidence) if new_rule.evidence else set()
 
     for existing in store.strategy_rules:
-        # Scope AND priority must match before any text-overlap merge.
         if existing.scope != new_rule.scope or existing.priority != new_rule.priority:
             continue
-        existing_words = _normalize_for_match(existing.rule)
-        if not existing_words:
+        ex_words = _normalize_for_match(existing.rule)
+        if not ex_words:
             continue
-        existing_bigrams = _bigrams(existing.rule)
+        # Early-exit if word overlap fails on both rule-text AND evidence paths
+        # — avoids the bigram computation (expensive) on unrelated rules.
+        rule_words_match = _overlap(new_words, ex_words) > 0.5
+        ev_words_match = bool(new_ev_words) and _overlap(new_ev_words, ex_words) > 0.5
+        if not (rule_words_match or ev_words_match):
+            continue
 
-        word_overlap = len(new_words & existing_words) / max(len(new_words), len(existing_words))
-        if word_overlap > 0.5 and existing_bigrams and new_bigrams:
-            bigram_overlap = (
-                len(new_bigrams & existing_bigrams)
-                / max(len(new_bigrams), len(existing_bigrams))
-            )
-            if bigram_overlap >= 0.5:
-                return existing
-
-        # Fall back to evidence-vs-rule match (user may phrase differently
-        # on the second occurrence).
-        if new_evidence_words:
-            ev_word_overlap = (
-                len(new_evidence_words & existing_words)
-                / max(len(new_evidence_words), len(existing_words))
-            )
-            if ev_word_overlap > 0.5 and existing_bigrams and new_evidence_bigrams:
-                ev_bigram_overlap = (
-                    len(new_evidence_bigrams & existing_bigrams)
-                    / max(len(new_evidence_bigrams), len(existing_bigrams))
-                )
-                if ev_bigram_overlap > 0.5:
-                    return existing
+        ex_bigrams = _bigrams(existing.rule)
+        if rule_words_match and _is_match(new_words, new_bigrams, ex_words, ex_bigrams):
+            return existing
+        if ev_words_match and _is_match(new_ev_words, new_ev_bigrams, ex_words, ex_bigrams):
+            return existing
     return None
 
 
+def _enforce_active_cap(store: DigestStore) -> None:
+    """Demote lowest-scored active rules until len(active) <= MAX_ACTIVE_RULES.
+
+    Single O(n log n) sort; demotes the bottom-k in one pass rather than
+    re-sorting per iteration.
+    """
+    active = store.active_rules()
+    overflow = len(active) - MAX_ACTIVE_RULES
+    if overflow <= 0:
+        return
+    scored = sorted(active, key=score_rule)
+    for rule in scored[:overflow]:
+        rule.status = "pending"
+
+
 def admit_rule(rule: DigestRule, store: DigestStore) -> str:
-    """A-MAC admission gate. Returns action taken: 'added', 'upvoted', 'rejected'.
+    """A-MAC admission gate. Returns 'added', 'upvoted', or 'rejected'.
 
     Quality gate BEFORE any rule enters store (arXiv:2505.16067).
     """
-    # Check for duplicate/similar existing rule
     existing = _find_duplicate(rule, store)
     if existing:
-        # ExpeL UPVOTE: reinforce existing rule
         existing.occurrence_count += 1
         existing.importance += 1
         existing.last_reinforced = rule.last_reinforced or datetime.now(timezone.utc).isoformat()
-        # Promote if threshold reached
         if existing.status == "pending" and existing.occurrence_count >= PROMOTION_COUNT:
             existing.status = "active"
         return "upvoted"
 
-    # Score the new rule
-    score = score_rule(rule)
-    if score < ADMISSION_THRESHOLD:
+    if score_rule(rule) < ADMISSION_THRESHOLD:
         return "rejected"
 
-    # Assign ID and add
     rule.id = store.next_id()
     store.strategy_rules.append(rule)
-
-    # Cap enforcement — loop until under cap to handle burst admissions.
-    active = store.active_rules()
-    while len(active) > MAX_ACTIVE_RULES:
-        scored = sorted(((score_rule(r), r) for r in active), key=lambda x: x[0])
-        scored[0][1].status = "pending"
-        active = store.active_rules()
-
+    _enforce_active_cap(store)
     return "added"
 
 
@@ -564,35 +566,50 @@ def admit_rule(rule: DigestRule, store: DigestStore) -> str:
 
 
 def _atomic_write_text(target: Path, data: str, encoding: str = "utf-8") -> None:
-    """Write `data` to `target` atomically.
+    """Write `data` to `target` atomically with `fsync`.
 
-    Writes to a hidden sibling (`.tmp.<name>`) whose path STILL ENDS with
-    the target's filename, then `os.replace`s it over `target`. Under a
-    mid-write crash the target is either fully-old or fully-new — never
-    partially truncated, because `os.replace` is atomic on POSIX and never
-    runs if the preceding temp write raised.
+    `fsync` before `os.replace` guarantees the new bytes are on disk before
+    the rename, so a power-loss or OOM-kill leaves `target` either fully-old
+    or fully-new — never zeroed or partially truncated. `mkstemp` provides
+    collision-safe temp paths for concurrent hook processes.
 
-    The `.tmp.<name>` prefix (rather than `<name>.tmp` suffix) preserves the
-    target filename as the temp path's suffix, so filesystem hooks / tests
-    that key on the target's filename also cover the temp write — keeping
-    the crash-safety contract verifiable.
+    The tmp filename keeps `target.name` as its SUFFIX so the tests' `endswith`
+    filesystem patches cover the temp write too (crash-safety is test-verified).
     """
-    tmp_path = target.with_name(f".tmp.{target.name}")
+    import tempfile
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".tmp.", suffix=target.name, dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
     try:
-        tmp_path.write_text(data, encoding=encoding)
-        os.replace(tmp_path, target)
-    finally:
-        if tmp_path.exists():
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(data)
+            f.flush()
             try:
-                tmp_path.unlink()
+                os.fsync(f.fileno())
             except OSError:
                 pass
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_digest_store(project_dir: str = "") -> DigestStore:
-    """Load the digest store from disk."""
-    if not DIGEST_FILE.exists():
-        return DigestStore(project=project_dir)
+    """Load the digest store from disk, auto-migrating pre-hardening rules.
+
+    Failure modes (missing file, bad JSON, permission denied, disk error) all
+    return an empty store rather than crash — this code runs inside hook
+    critical path (PreCompact, Stop) where exceptions would kill the session.
+
+    Auto-migration: demotes any active rule that would not pass the current
+    admission gate (noise OR rejected by `_to_prohibition`), so users who
+    upgrade inherit a clean store with zero action required.
+    """
     try:
         data = json.loads(DIGEST_FILE.read_text(encoding="utf-8"))
         store = DigestStore(
@@ -603,32 +620,15 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
         )
         for rd in data.get("strategy_rules", []):
             store.strategy_rules.append(DigestRule(**rd))
-        # Auto-migration for stores written before the hardening — demote any
-        # active rule whose stored evidence/rule text would NOT pass the current
-        # admission gate. This covers:
-        #   (a) CC synthetic noise (tags, slash commands, framework markers)
-        #   (b) Structural content that _to_prohibition rejects (markdown-lead,
-        #       oversize > 200 chars, multi-line, code fence)
-        # Composing the two existing validators gives users a zero-action upgrade:
-        # their next session loads the fix, the purge demotes pre-hardening noise,
-        # and only rules that pass the current contract remain active.
         for rule in store.strategy_rules:
             if rule.status != "active":
                 continue
             source = rule.evidence or rule.rule
             if _is_system_noise(source) or _to_prohibition(source) == "":
                 rule.status = "pending"
-        # Retroactive cap sweep — a pre-polluted store must be trimmed on load,
-        # otherwise the per-admit cap never converges when no new rules arrive.
-        active = store.active_rules()
-        while len(active) > MAX_ACTIVE_RULES:
-            scored = sorted(((score_rule(r), r) for r in active), key=lambda x: x[0])
-            scored[0][1].status = "pending"
-            active = store.active_rules()
+        _enforce_active_cap(store)
         return store
     except (json.JSONDecodeError, TypeError, KeyError, OSError):
-        # OSError covers PermissionError, IsADirectoryError, disk IO failures.
-        # Crashing a PreCompact/Stop hook on a bad digest file is never acceptable.
         return DigestStore(project=project_dir)
 
 
@@ -780,28 +780,19 @@ def build_injection_text(store: DigestStore) -> str | None:
     if not active:
         return None
 
-    # Hard rules first, then soft, capped at MAX_ACTIVE_RULES
-    hard = [r for r in active if r.priority == "hard"]
-    soft = [r for r in active if r.priority == "soft"]
-    rules = (hard + soft)[:MAX_ACTIVE_RULES]
+    # Hard first, then soft up to the remaining cap slots.
+    hard = [r for r in active if r.priority == "hard"][:MAX_ACTIVE_RULES]
+    soft_budget = max(0, MAX_ACTIVE_RULES - len(hard))
+    soft = [r for r in active if r.priority == "soft"][:soft_budget]
 
-    lines = [
-        "BEHAVIORAL CONTRACT — Focus solely on these rules when applicable.",
-        "",
-    ]
-
-    hard_rules = [r for r in rules if r.priority == "hard"]
-    if hard_rules:
+    lines = ["BEHAVIORAL CONTRACT — Focus solely on these rules when applicable.", ""]
+    if hard:
         lines.append("PROHIBITIONS:")
-        for r in hard_rules:
-            lines.append(_format_rule_4field(r))
+        lines.extend(_format_rule_4field(r) for r in hard)
         lines.append("")
-
-    soft_rules = [r for r in rules if r.priority == "soft"]
-    if soft_rules:
+    if soft:
         lines.append("PREFERENCES:")
-        for r in soft_rules:
-            lines.append(_format_rule_4field(r))
+        lines.extend(_format_rule_4field(r) for r in soft)
         lines.append("")
 
     return "\n".join(lines)
@@ -810,28 +801,20 @@ def build_injection_text(store: DigestStore) -> str | None:
 def _get_memdir(cwd: str = "") -> Path | None:
     """Find the Claude Code memory directory for the given project.
 
-    Honours `CLAUDE_CONFIG_DIR` env var (set by the `claudes` profile launcher)
-    before falling back to `~/.claude`. This prevents cross-profile leaks
-    where work-session digests land in the personal memdir.
+    Delegates profile resolution to `session.get_projects_dir()` which honours
+    `CLAUDE_CONFIG_DIR` (used by the `claudes` profile launcher) before
+    falling back to `~/.claude`. Prevents cross-profile leaks.
     """
     import os
+    from .session import get_projects_dir
     if not cwd:
         cwd = os.getcwd()
-    # CC stores memories at $CLAUDE_CONFIG_DIR/projects/<slug>/memory (or
-    # ~/.claude/projects/<slug>/memory if the env var is not set).
-    config_dir_env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if config_dir_env:
-        config_dir = Path(config_dir_env).expanduser()
-    else:
-        config_dir = Path.home() / ".claude"
-    claude_dir = config_dir / "projects"
+    claude_dir = get_projects_dir()
     if not claude_dir.exists():
         return None
-    # Sanitize cwd the same way CC does: replace / with -
     slug = cwd.lstrip("/").replace("/", "-")
     project_dir = claude_dir / f"-{slug}"
     if not project_dir.exists():
-        # Try finding by prefix match (CC may use different sanitization)
         for d in claude_dir.iterdir():
             if d.is_dir() and slug in d.name:
                 project_dir = d

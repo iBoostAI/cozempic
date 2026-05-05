@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -1438,32 +1439,24 @@ class TestAtomicSave(unittest.TestCase):
                 evidence="don't add this",
             ))
 
-            real_write_text = Path.write_text
+            # Simulate a real mid-write crash by patching os.replace — the
+            # atomic-commit syscall that MUST succeed for the new bytes to
+            # land on the target. If os.replace raises, any well-written
+            # atomic save MUST leave the target file byte-for-byte unchanged
+            # (the tmp file may be leaked, that's handled by the save's
+            # try/finally). This test is impl-agnostic: it checks the
+            # crash-safety CONTRACT, not a specific tmp naming scheme.
+            real_replace = os.replace
 
-            def exploding_write_text(self, data, *args, **kwargs):
-                # Simulate a real mid-write crash: open the target file in
-                # truncate mode (destroys the on-disk content), write a
-                # PARTIAL prefix, then raise. This is what happens when a
-                # process is killed between `open(mode="w")` and the final
-                # `close`.
-                #
-                # The ONLY defence against this is atomic-replace — writing
-                # to a `.tmp` sibling and then `os.replace`'ing it, so the
-                # target file either contains the old bytes or the new
-                # bytes, never a truncated partial.
-                target = str(self)
-                if target.endswith("behavioral-digest.json"):
-                    # Open-truncate with partial write, then crash
-                    with open(self, "w", encoding="utf-8") as f:
-                        f.write(data[:64])  # partial write
-                    raise IOError("simulated mid-write crash after partial write")
-                return real_write_text(self, data, *args, **kwargs)
+            def exploding_replace(src, dst, *args, **kwargs):
+                if str(dst).endswith("behavioral-digest.json"):
+                    raise IOError("simulated os.replace failure mid-commit")
+                return real_replace(src, dst, *args, **kwargs)
 
             with patch("cozempic.digest.DIGEST_DIR", tmp_path), \
                  patch("cozempic.digest.DIGEST_FILE", digest_file), \
                  patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
-                 patch.object(Path, "write_text", exploding_write_text):
-                # Save may raise — that's expected when the crash hits.
+                 patch("cozempic.digest.os.replace", exploding_replace):
                 try:
                     save_digest_store(new_store)
                 except (IOError, OSError):
