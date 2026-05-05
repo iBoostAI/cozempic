@@ -201,11 +201,19 @@ class TestExtractCorrections(unittest.TestCase):
         rules = extract_corrections(messages)
         self.assertEqual(rules[0].scope, "file-ops")
 
-    def test_caps_rule_length(self):
+    def test_rejects_text_over_200_chars(self):
+        """Long inputs are rejected (BUG-2 hardening) — extract_corrections skips them.
+
+        Previously this test asserted the rule was capped at 500 chars ("don't " + 1000 x chars),
+        but that behavior allowed 500 chars of raw noise to be "Do not "-prefixed and truncated
+        mid-tag — the root cause of the R001 = `Do not <local-command-caveat>...` pollution.
+        After BUG-2 fix, inputs > 200 chars return "" from _to_prohibition and extract_corrections
+        skips the turn.
+        """
         long_text = "don't " + "x" * 1000
         messages = [make_user(0, long_text)]
         rules = extract_corrections(messages)
-        self.assertLessEqual(len(rules[0].rule), 500)
+        self.assertEqual(len(rules), 0)
 
 
 # ---------------------------------------------------------------------------
