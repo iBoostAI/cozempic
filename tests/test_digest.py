@@ -1646,5 +1646,158 @@ class TestMemdirConfigDirFallback(unittest.TestCase):
                                 f"expected .claude/... suffix, got {result}")
 
 
+class TestLoadRevalidatesRulesAgainstHardening(unittest.TestCase):
+    """Auto-migration: pre-existing stores with rules that would be REJECTED by the
+    current hardening (_to_prohibition gate + _is_system_noise) must be demoted on
+    load. This is the "zero user action needed on upgrade" contract.
+
+    Real-world pollution seen pre-fix:
+    - Long multi-paragraph prompts ("# BMAD — Big Model Adversarial Debate...")
+    - Pasted messages ("regarde ce message slack de notre po Hello team...")
+    - cozempic-self meta noise ("[Cozempic Guard: context was pruned...]")
+    - Compaction-resume banners ("This session is being continued...")
+
+    None of these pass _to_prohibition (>200 chars, multi-line, markdown-lead)
+    but a pre-hardening store has them stored as status=active.
+    """
+
+    def test_load_demotes_markdown_prefixed_active(self):
+        """Rule with evidence starting with '#' (markdown header) must be demoted."""
+        import tempfile
+        from cozempic.digest import DigestStore, DigestRule, save_digest_store, load_digest_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_md = Path(tmp) / "behavioral-digest.md"
+            # Pre-populate a store with a markdown-prefixed active rule (as if saved pre-fix)
+            store = DigestStore(project="/test")
+            store.strategy_rules.append(DigestRule(
+                id="R001",
+                rule="Do not # BMAD — Big Model Adversarial Debate prompt text here",
+                evidence="# BMAD — Big Model Adversarial Debate\n\nYou are the Leader",
+                priority="hard", scope="general",
+                source_reliability=1.0, type_prior=0.8,
+                occurrence_count=1, status="active",
+                first_seen="2026-04-01", last_reinforced="2026-04-01",
+            ))
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+                 patch("cozempic.digest.DIGEST_DIR", Path(tmp)):
+                save_digest_store(store)
+                reloaded = load_digest_store("/test")
+                self.assertEqual(len(reloaded.active_rules()), 0,
+                                 "markdown-prefixed rule must be demoted on load — "
+                                 "upgrade-time auto-migration")
+
+    def test_load_demotes_oversize_active(self):
+        """Rule with evidence > 200 chars must be demoted (matches _to_prohibition gate)."""
+        import tempfile
+        from cozempic.digest import DigestStore, DigestRule, save_digest_store, load_digest_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_md = Path(tmp) / "behavioral-digest.md"
+            long_evidence = "Regarde ce message slack " + "x" * 300
+            store = DigestStore(project="/test")
+            store.strategy_rules.append(DigestRule(
+                id="R001", rule="Do not " + long_evidence[:193],
+                evidence=long_evidence,
+                priority="hard", scope="git",
+                source_reliability=1.0, type_prior=0.8,
+                occurrence_count=1, status="active",
+            ))
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+                 patch("cozempic.digest.DIGEST_DIR", Path(tmp)):
+                save_digest_store(store)
+                reloaded = load_digest_store("/test")
+                self.assertEqual(len(reloaded.active_rules()), 0,
+                                 "oversize rule must be demoted on load")
+
+    def test_load_demotes_multiline_active(self):
+        """Rule with > 2 newlines in evidence must be demoted."""
+        import tempfile
+        from cozempic.digest import DigestStore, DigestRule, save_digest_store, load_digest_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_md = Path(tmp) / "behavioral-digest.md"
+            store = DigestStore(project="/test")
+            store.strategy_rules.append(DigestRule(
+                id="R001", rule="Do not multi line prompt",
+                evidence="line1\nline2\nline3\nline4 with don't",
+                priority="hard", scope="general",
+                source_reliability=1.0, type_prior=0.8,
+                occurrence_count=1, status="active",
+            ))
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+                 patch("cozempic.digest.DIGEST_DIR", Path(tmp)):
+                save_digest_store(store)
+                reloaded = load_digest_store("/test")
+                self.assertEqual(len(reloaded.active_rules()), 0,
+                                 "multi-line rule must be demoted on load")
+
+    def test_load_demotes_cozempic_meta_noise(self):
+        """Cozempic's own compaction-restoration banner is self-noise."""
+        is_noise = _import_system_noise()
+        # Part 1: direct test of the marker
+        self.assertTrue(is_noise("[Cozempic Guard: context was pruned. Team state restored below]"))
+
+        # Part 2: integration via load
+        import tempfile
+        from cozempic.digest import DigestStore, DigestRule, save_digest_store, load_digest_store
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_md = Path(tmp) / "behavioral-digest.md"
+            store = DigestStore(project="/test")
+            store.strategy_rules.append(DigestRule(
+                id="R001", rule="Do not [Cozempic Guard: context was pruned",
+                evidence="[Cozempic Guard: context was pruned. Team state restored below for your reference — do not echo it back]",
+                priority="hard", scope="general",
+                source_reliability=1.0, type_prior=0.8,
+                occurrence_count=1, status="active",
+            ))
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+                 patch("cozempic.digest.DIGEST_DIR", Path(tmp)):
+                save_digest_store(store)
+                reloaded = load_digest_store("/test")
+                self.assertEqual(len(reloaded.active_rules()), 0,
+                                 "cozempic-meta noise rule must be demoted on load")
+
+    def test_load_demotes_session_resume_banner(self):
+        """Claude Code compaction-resume banner is noise, not a correction."""
+        is_noise = _import_system_noise()
+        banner = "This session is being continued from a previous conversation that ran out of context."
+        # Long + specific phrase → should be caught
+        self.assertTrue(is_noise(banner))
+
+    def test_load_preserves_genuine_clean_corrections(self):
+        """Baseline: genuine, short, well-formed corrections are PRESERVED on load."""
+        import tempfile
+        from cozempic.digest import DigestStore, DigestRule, save_digest_store, load_digest_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            digest_file = Path(tmp) / "behavioral-digest.json"
+            digest_md = Path(tmp) / "behavioral-digest.md"
+            store = DigestStore(project="/test")
+            store.strategy_rules.append(DigestRule(
+                id="R001",
+                rule="Do not add Co-Authored-By",
+                evidence="don't add Co-Authored-By",
+                priority="hard", scope="git",
+                source_reliability=1.0, type_prior=0.8,
+                occurrence_count=3, status="active",
+            ))
+            with patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+                 patch("cozempic.digest.DIGEST_DIR", Path(tmp)):
+                save_digest_store(store)
+                reloaded = load_digest_store("/test")
+                self.assertEqual(len(reloaded.active_rules()), 1,
+                                 "genuine clean correction must be preserved on load")
+
+
 if __name__ == "__main__":
     unittest.main()
