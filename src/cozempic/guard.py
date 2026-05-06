@@ -842,6 +842,12 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
         print(f"  SSH session — skipping terminate+resume. Resume manually: {resume_cmd}")
         return
 
+    # Verify the PID still belongs to a Claude process before sending any signal.
+    # claude_pid is captured at daemon start; it may have been recycled.
+    if not _is_claude_process(claude_pid):
+        print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
+        return
+
     if term_env == "tmux":
         # tmux: graceful /exit via send-keys, then resume in same pane
         pane = os.environ.get("TMUX_PANE", "")
@@ -856,7 +862,8 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
 
         # Wait for Claude to exit
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            os.kill(claude_pid, signal.SIGTERM)
+            if _is_claude_process(claude_pid):
+                os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
         time.sleep(1)
@@ -880,7 +887,8 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
         )
 
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            os.kill(claude_pid, signal.SIGTERM)
+            if _is_claude_process(claude_pid):
+                os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
         time.sleep(1)
@@ -908,7 +916,8 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
                 subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                os.kill(claude_pid, signal.SIGKILL)
+                if _is_claude_process(claude_pid):
+                    os.kill(claude_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
