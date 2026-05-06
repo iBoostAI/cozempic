@@ -966,9 +966,10 @@ def _cleanup_legacy_pid(cwd: str) -> None:
         try:
             pid = int(legacy.read_text().strip())
             os.kill(pid, 0)
-            # Still alive — kill it so session-scoped guard can take over
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(1)
+            # Only SIGTERM if we can confirm this is actually our daemon.
+            if _is_cozempic_guard_process(pid):
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(1)
         except (ValueError, ProcessLookupError, PermissionError, OSError):
             pass
         legacy.unlink(missing_ok=True)
