@@ -974,7 +974,8 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
                 subprocess.call(["taskkill", "/PID", str(claude_pid)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            os.kill(claude_pid, signal.SIGTERM)
+            if _is_claude_process(claude_pid):
+                os.kill(claude_pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
