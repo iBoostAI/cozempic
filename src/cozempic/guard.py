@@ -969,8 +969,9 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     # Plain terminal — SIGTERM + spawn resume watcher
     try:
         if system == "Windows":
-            subprocess.call(["taskkill", "/PID", str(claude_pid)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if _is_claude_process(claude_pid):
+                subprocess.call(["taskkill", "/PID", str(claude_pid)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             os.kill(claude_pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
@@ -979,8 +980,9 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     if not _wait_for_exit(claude_pid, timeout=5.0):
         try:
             if system == "Windows":
-                subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if _is_claude_process(claude_pid):
+                    subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 if _is_claude_process(claude_pid):
                     os.kill(claude_pid, signal.SIGKILL)
