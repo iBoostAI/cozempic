@@ -1194,6 +1194,39 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         return False
 
 
+def _is_claude_process(pid: int) -> bool:
+    """Verify that `pid` is a Claude Code process (node/claude binary).
+
+    Mirrors _is_cozempic_guard_process but for the Claude client side.
+    Guards against PID reuse: if Claude exits and its PID is recycled, a blind
+    SIGTERM on the recycled PID is a confused-deputy bug.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        args = (result.stdout or "").strip()
+        tokens = args.split()
+        if not tokens:
+            return False
+        comm = tokens[0].lower()
+        # Match node-based Claude Code invocations
+        if "node" in comm:
+            return True
+        # Match native claude binary
+        if comm.endswith("claude") or comm == "claude":
+            return True
+        # Match explicit claude-code invocations in args
+        if "claude-code" in args or "@anthropic-ai/claude-code" in args:
+            return True
+        return False
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def _pid_file_points_to(session_id: str, expected_pid: int) -> bool:
     """CAS helper: return True if the session pid file currently contains
     `expected_pid`. Used before unlink() to avoid clobbering a fresh pid
