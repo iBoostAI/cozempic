@@ -1,6 +1,6 @@
 # Cozempic
 
-![Downloads](https://img.shields.io/badge/downloads-35k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.6-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![Downloads](https://img.shields.io/badge/downloads-35k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.7-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 **35,000+ power users** trust Cozempic to keep their Claude Code sessions lean.
 
@@ -162,7 +162,7 @@ cozempic digest inject
 
 **How it works:**
 - Detects correction signals in your messages ("don't do X", "stop adding Y", "always use Z")
-- Explicit corrections activate immediately; implicit corrections need 2 occurrences
+- All corrections start as "pending" and activate after 2 occurrences (prevents one-shot noise from polluting the digest)
 - Rules synced to Claude Code's native memory system (`~/.claude/projects/<cwd>/memory/`)
 - Claude reads these as feedback memories on every turn — they survive compaction natively
 - PreCompact and Stop hooks auto-extract before context is lost

@@ -620,13 +620,24 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
         )
         for rd in data.get("strategy_rules", []):
             store.strategy_rules.append(DigestRule(**rd))
+        migrated = False
         for rule in store.strategy_rules:
             if rule.status != "active":
                 continue
             source = rule.evidence or rule.rule
             if _is_system_noise(source) or _to_prohibition(source) == "":
                 rule.status = "pending"
+                migrated = True
         _enforce_active_cap(store)
+        # Persist the migration so we don't re-scan on every load.
+        # Without this, a store with 572 noise rules would re-demote them
+        # on every cozempic invocation — wasting cycles and never cleaning
+        # the on-disk file unless a separate save path happens to fire.
+        if migrated:
+            try:
+                save_digest_store(store)
+            except Exception:
+                pass  # Non-fatal — store is clean in memory, disk catches up later
         return store
     except (json.JSONDecodeError, TypeError, KeyError, OSError):
         return DigestStore(project=project_dir)

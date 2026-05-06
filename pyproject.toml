@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cozempic"
-version = "1.8.6"
+version = "1.8.7"
 description = "2x the effective context with smart weight-loss for Claude Code — prune bloated sessions, protect agent teams from compaction, monitor token usage with MCP tools"
 readme = "README.md"
 license = "MIT"

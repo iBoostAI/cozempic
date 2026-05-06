@@ -1794,3 +1794,116 @@ class TestLoadRevalidatesRulesAgainstHardening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Follow-up: boundary tests for _to_prohibition + purge persistence ─────
+
+class TestToProhibitionBoundary(unittest.TestCase):
+    """Edge cases at exact thresholds for _to_prohibition rejection."""
+
+    def test_exactly_200_chars_passes(self):
+        """200 chars should pass (threshold is > 200, not >=)."""
+        text = "don't " + "x" * 194  # 6 + 194 = 200
+        self.assertEqual(len(text), 200)
+        result = _to_prohibition(text)
+        self.assertNotEqual(result, "", "exactly 200 chars must pass")
+
+    def test_201_chars_rejected(self):
+        """201 chars should be rejected."""
+        text = "don't " + "x" * 195  # 6 + 195 = 201
+        self.assertEqual(len(text), 201)
+        self.assertEqual(_to_prohibition(text), "")
+
+    def test_exactly_2_newlines_passes(self):
+        """2 newlines should pass (threshold is > 2, not >=)."""
+        text = "don't do line1\nline2\nline3"
+        self.assertEqual(text.count("\n"), 2)
+        result = _to_prohibition(text)
+        self.assertNotEqual(result, "", "exactly 2 newlines must pass")
+
+    def test_3_newlines_rejected(self):
+        """3 newlines should be rejected."""
+        text = "don't do\nline1\nline2\nline3"
+        self.assertEqual(text.count("\n"), 3)
+        self.assertEqual(_to_prohibition(text), "")
+
+
+class TestPurgePersistsToDisk(unittest.TestCase):
+    """load_digest_store must save the migrated state so the purge is one-shot."""
+
+    def test_purge_writes_back_to_disk(self):
+        """After loading a polluted store, the on-disk file should reflect
+        the demotions — so a second load doesn't re-scan."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            digest_file = tmp_path / "behavioral-digest.json"
+
+            # Build a store with noise rules
+            rules = []
+            for i in range(5):
+                rules.append({
+                    "id": f"R{i:03d}",
+                    "rule": f"Do not <teammate-message>noise {i}</teammate-message>",
+                    "priority": "hard",
+                    "scope": "general",
+                    "trigger": "",
+                    "decision_step": "",
+                    "before": "",
+                    "after": "",
+                    "signal": "EXPLICIT_CORRECTION",
+                    "evidence": f"<teammate-message>noise {i}</teammate-message>",
+                    "importance": 1,
+                    "source_reliability": 1.0,
+                    "type_prior": 0.8,
+                    "status": "active",
+                    "occurrence_count": 2,
+                    "first_seen": "2026-05-01T00:00:00",
+                    "last_reinforced": "2026-05-01T00:00:00",
+                    "last_injection": None,
+                })
+            # Add one clean rule
+            rules.append({
+                "id": "R099",
+                "rule": "Do not add Co-Authored-By to commits",
+                "priority": "hard",
+                "scope": "git",
+                "trigger": "",
+                "decision_step": "",
+                "before": "",
+                "after": "",
+                "signal": "EXPLICIT_CORRECTION",
+                "evidence": "never add Co-Authored-By",
+                "importance": 3,
+                "source_reliability": 1.0,
+                "type_prior": 0.8,
+                "status": "active",
+                "occurrence_count": 3,
+                "first_seen": "2026-05-01T00:00:00",
+                "last_reinforced": "2026-05-01T00:00:00",
+                "last_injection": None,
+            })
+
+            data = {
+                "version": "1", "project": "/test", "updated": "",
+                "session_id": "", "strategy_rules": rules, "failure_patterns": [],
+            }
+            digest_file.write_text(json.dumps(data), encoding="utf-8")
+
+            from unittest.mock import patch
+            with patch("cozempic.digest.DIGEST_FILE", digest_file):
+                # First load — should purge + save
+                store1 = load_digest_store("/test")
+                active1 = [r for r in store1.strategy_rules if r.status == "active"]
+                self.assertEqual(len(active1), 1, "only clean rule should be active")
+                self.assertIn("Co-Authored-By", active1[0].rule)
+
+                # Verify disk was updated
+                disk_data = json.loads(digest_file.read_text())
+                disk_active = [r for r in disk_data["strategy_rules"] if r["status"] == "active"]
+                self.assertEqual(len(disk_active), 1,
+                    "purged state must be persisted to disk")
+
+                # Second load — should be a no-op (no re-purge needed)
+                store2 = load_digest_store("/test")
+                active2 = [r for r in store2.strategy_rules if r.status == "active"]
+                self.assertEqual(len(active2), 1)
