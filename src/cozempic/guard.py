@@ -1216,11 +1216,15 @@ def start_guard_daemon(
 
     # Atomically claim the pid slot before spawning (O_CREAT|O_EXCL prevents TOCTOU).
     # If EEXIST, another concurrent starter won the race — return already_running.
+    # Other OSErrors (ENOSPC, EROFS, EACCES) are non-fatal: return started=False
+    # with a reason so the non-interactive SessionStart hook doesn't crash silently.
     try:
         fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, b"0")  # placeholder; real PID written after Popen
         os.close(fd)
-    except FileExistsError:
+    except (FileExistsError, OSError) as _e:
+        if not isinstance(_e, FileExistsError):
+            return {"started": False, "reason": f"pidfile: {_e}"}
         # Re-read and verify to handle the case where the winner's daemon is up
         existing_pid = _is_guard_running_for_session(session_id) if session_id else None
         if existing_pid:
@@ -1237,7 +1241,9 @@ def start_guard_daemon(
             fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, b"0")
             os.close(fd)
-        except FileExistsError:
+        except (FileExistsError, OSError) as _e2:
+            if not isinstance(_e2, FileExistsError):
+                return {"started": False, "reason": f"pidfile: {_e2}"}
             existing_pid = _is_guard_running_for_session(session_id) if session_id else None
             return {
                 "started": False,
