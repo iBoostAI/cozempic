@@ -166,9 +166,12 @@ class TestFlushRecover(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_flush_extracts_and_syncs(self):
+        """Post-BUG-4 fix: rules start as pending. Two occurrences → promote to active → memdir synced."""
         messages = [
             make_assistant(0, "I'll add the Co-Authored-By"),
             make_user(1, "don't add Co-Authored-By"),
+            make_assistant(2, "I'll add Co-Authored-By again"),
+            make_user(3, "don't add Co-Authored-By to commits"),
         ]
         digest_file = self.tmpdir / "behavioral-digest.json"
         digest_md = self.tmpdir / "behavioral-digest.md"
@@ -178,9 +181,9 @@ class TestFlushRecover(unittest.TestCase):
              patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
             added, upvoted, rejected = flush_digest(messages, project_dir="/test")
-            self.assertGreater(added, 0)
+            self.assertGreater(added + upvoted, 0)
             self.assertTrue(digest_file.exists())
-            # Memdir should have been synced too
+            # Memdir should have been synced too (rule promoted to active via 2nd occurrence)
             digest_mem = self.mem_dir / "cozempic_digest.md"
             self.assertTrue(digest_mem.exists())
 
@@ -200,7 +203,11 @@ class TestFlushRecover(unittest.TestCase):
             self.assertIn("Co-Authored-By", content)
 
     def test_full_cycle(self):
-        """flush → compaction (memdir survives) → recover re-syncs."""
+        """flush → compaction (memdir survives) → recover re-syncs.
+
+        Post-BUG-4 fix: rules start pending, promoted to active via PROMOTION_COUNT=2.
+        Test uses 2 occurrences of the same correction to trigger promotion.
+        """
         digest_file = self.tmpdir / "behavioral-digest.json"
         digest_md = self.tmpdir / "behavioral-digest.md"
 
@@ -209,14 +216,16 @@ class TestFlushRecover(unittest.TestCase):
              patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
 
-            # Flush: extract corrections
+            # Flush: extract corrections (2 occurrences → promote via upvote)
             messages = [
                 make_assistant(0, "I'll add Co-Authored-By"),
                 make_user(1, "don't add Co-Authored-By"),
+                make_assistant(2, "adding Co-Authored-By again"),
+                make_user(3, "don't add Co-Authored-By to commits"),
             ]
             flush_digest(messages, project_dir="/test")
 
-            # Verify active immediately (explicit correction)
+            # Verify active after 2nd occurrence (PROMOTION_COUNT=2 threshold met)
             store = load_digest_store("/test")
             self.assertGreater(len(store.active_rules()), 0)
 

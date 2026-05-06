@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -115,6 +116,69 @@ _EXPLICIT_PATTERNS = [
     re.compile(r"\bremove\s+that\b", re.IGNORECASE),
     re.compile(r"\bundo\s+(that|this|the)\b", re.IGNORECASE),
 ]
+
+# Synthetic-noise markers — user turns containing any of these are Claude Code
+# framework emissions (hooks, slash commands, tool blocks), not real corrections.
+_SYSTEM_NOISE_MARKERS = (
+    "<local-command-",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<teammate-message",
+    "<system-reminder",
+    "<function_calls>",
+    "<function_results>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<user-prompt-submit-hook",
+    "Please analyze this codebase",  # /init prompt
+    "[Cozempic Guard:",  # cozempic self-restoration meta banner
+    "This session is being continued from a previous conversation",  # CC compaction-resume banner
+)
+
+
+# Zero-width and format characters sometimes injected before tag brackets:
+# ZWSP (U+200B), ZWNJ (U+200C), ZWJ (U+200D), BOM (U+FEFF), WORD JOINER (U+2060),
+# LRM (U+200E), RLM (U+200F). `str.strip()` does NOT remove these by default.
+_ZERO_WIDTH_PREFIX_CHARS = ("​", "‌", "‍", "﻿", "⁠", "‎", "‏")
+
+# Unicode tag-bracket lookalikes — when they appear as the LEADING char of a
+# turn, the turn is a synthetic/wrapped emission, not a user correction.
+# Substring match would false-positive on genuine user text that happens to
+# quote a word with guillemets (« foo ») or fullwidth punctuation — so we
+# restrict to startswith.
+_UNICODE_TAG_LEAD_CHARS = ("＜", "«", "〈")  # ＜ « 〈
+
+
+def _is_system_noise(text: str) -> bool:
+    """Return True if `text` is a Claude Code synthetic/framework turn.
+
+    Rejects: empty text, tag-wrapped blocks (ASCII `<` or Unicode lookalikes),
+    slash-command lines, and known framework prompt markers. Used to gate
+    `extract_corrections` upstream of `classify_turn` so synthetic turns
+    never become behavioral rules.
+    """
+    if not text:
+        return True
+    # Strip standard whitespace AND zero-width format chars (A1 — some emitters
+    # inject ZWSP/BOM before the opening '<' which bypasses a plain strip()).
+    stripped = text.strip().lstrip("".join(_ZERO_WIDTH_PREFIX_CHARS))
+    if not stripped:
+        return True
+    # Tag-like: any line starting with '<' is either synthetic or XML.
+    if stripped.startswith("<"):
+        return True
+    # Unicode tag-bracket lookalikes as LEADING char (A1 — fullwidth ＜, «, 〈).
+    if stripped[0] in _UNICODE_TAG_LEAD_CHARS:
+        return True
+    # Slash command: '/' + lowercase letter (distinguish from file paths like /Users)
+    if len(stripped) >= 2 and stripped[0] == "/" and stripped[1].islower():
+        return True
+    # Known framework markers (substring match).
+    for marker in _SYSTEM_NOISE_MARKERS:
+        if marker in stripped:
+            return True
+    return False
 
 _IMPLICIT_PATTERNS = [
     re.compile(r"\bactually[,\s]", re.IGNORECASE),
@@ -235,8 +299,17 @@ def _to_prohibition(text: str) -> str:
     "Don't add X" → "Do not add X"
     "Stop doing X" → "Do not do X"
     "No, use Y instead" → "Do not use the previous approach; use Y instead"
+
+    Returns empty string (sentinel for "skip this candidate") when the input
+    is obviously structural/non-correction content: too long, multi-paragraph,
+    leading markdown, code fence, or tag.
     """
     text = text.strip()
+    # Reject structural / oversize input — cannot be a clean correction.
+    if not text or len(text) > 200 or text.count("\n") > 2:
+        return ""
+    if text[0] in "<-*#`":
+        return ""
     # Already in prohibition form
     if text.lower().startswith("do not ") or text.lower().startswith("don't "):
         return text[0].upper() + text[1:]
@@ -298,6 +371,11 @@ def extract_corrections(
         if not user_text:
             continue
 
+        # Skip Claude Code synthetic/framework turns — they are not corrections.
+        if _is_system_noise(user_text):
+            prev_assistant_text = ""
+            continue
+
         turn_class = classify_turn(user_text, prev_assistant_text)
         if turn_class == "NONE":
             prev_assistant_text = ""
@@ -320,6 +398,10 @@ def extract_corrections(
         }
 
         rule_text = _to_prohibition(user_text)
+        if not rule_text:
+            # _to_prohibition rejected the input as structural/non-correction.
+            prev_assistant_text = ""
+            continue
         scope = _infer_scope(user_text)
 
         rule = DigestRule(
@@ -335,8 +417,9 @@ def extract_corrections(
             importance=1,
             source_reliability=reliability_map.get(turn_class, 0.5),
             type_prior=type_prior_map.get(turn_class, 0.5),
-            # Explicit corrections are high-confidence — active immediately
-            status="active" if turn_class == "EXPLICIT_CORRECTION" else "pending",
+            # All new rules start pending — the repetition gate in admit_rule
+            # promotes them to active after PROMOTION_COUNT occurrences.
+            status="pending",
             occurrence_count=1,
             first_seen=now,
             last_reinforced=now,
@@ -377,64 +460,103 @@ def _normalize_for_match(text: str) -> set[str]:
     return words - _STOP
 
 
+def _bigrams(text: str) -> set[str]:
+    """Return token-level bigrams of `text` — used to distinguish rules that
+    share vocabulary but differ in word order (e.g., "use Edit not Write" vs
+    "use Write not Edit")."""
+    tokens = text.lower().split()
+    return {f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)}
+
+
+def _overlap(a: set, b: set) -> float:
+    """Jaccard-like overlap: shared / max(|a|, |b|). 0.0 on empty."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(len(a), len(b))
+
+
+def _is_match(new_words: set, new_bigrams: set, ex_words: set, ex_bigrams: set) -> bool:
+    """True if word AND bigram overlap both pass 0.5 threshold.
+
+    Bigram overlap distinguishes order-inverted rules like "use Edit not Write"
+    vs "use Write not Edit" which share bag-of-words but have opposite intent.
+    """
+    if _overlap(new_words, ex_words) <= 0.5:
+        return False
+    return _overlap(new_bigrams, ex_bigrams) >= 0.5
+
+
 def _find_duplicate(new_rule: DigestRule, store: DigestStore) -> DigestRule | None:
-    """Find a semantically similar existing rule (normalized word overlap for Phase 1)."""
+    """Find a semantically similar existing rule.
+
+    Requires scope AND priority match first (opposite-priority or cross-scope
+    rules are different instructions even if text overlaps), then both
+    word-overlap > 0.5 and bigram-overlap >= 0.5 on rule text OR on the
+    user-phrased evidence.
+    """
     new_words = _normalize_for_match(new_rule.rule)
     if not new_words:
         return None
-    # Also check evidence for stronger matching
-    new_evidence_words = _normalize_for_match(new_rule.evidence) if new_rule.evidence else set()
+    new_bigrams = _bigrams(new_rule.rule)
+    new_ev_words = _normalize_for_match(new_rule.evidence) if new_rule.evidence else set()
+    new_ev_bigrams = _bigrams(new_rule.evidence) if new_rule.evidence else set()
 
     for existing in store.strategy_rules:
-        existing_words = _normalize_for_match(existing.rule)
-        if not existing_words:
+        if existing.scope != new_rule.scope or existing.priority != new_rule.priority:
             continue
-        # Match against rule text
-        overlap = len(new_words & existing_words) / max(len(new_words), len(existing_words))
-        if overlap > 0.5:
+        ex_words = _normalize_for_match(existing.rule)
+        if not ex_words:
+            continue
+        # Early-exit if word overlap fails on both rule-text AND evidence paths
+        # — avoids the bigram computation (expensive) on unrelated rules.
+        rule_words_match = _overlap(new_words, ex_words) > 0.5
+        ev_words_match = bool(new_ev_words) and _overlap(new_ev_words, ex_words) > 0.5
+        if not (rule_words_match or ev_words_match):
+            continue
+
+        ex_bigrams = _bigrams(existing.rule)
+        if rule_words_match and _is_match(new_words, new_bigrams, ex_words, ex_bigrams):
             return existing
-        # Also match new evidence against existing rule (user may phrase differently)
-        if new_evidence_words:
-            ev_overlap = len(new_evidence_words & existing_words) / max(len(new_evidence_words), len(existing_words))
-            if ev_overlap > 0.5:
-                return existing
+        if ev_words_match and _is_match(new_ev_words, new_ev_bigrams, ex_words, ex_bigrams):
+            return existing
     return None
 
 
+def _enforce_active_cap(store: DigestStore) -> None:
+    """Demote lowest-scored active rules until len(active) <= MAX_ACTIVE_RULES.
+
+    Single O(n log n) sort; demotes the bottom-k in one pass rather than
+    re-sorting per iteration.
+    """
+    active = store.active_rules()
+    overflow = len(active) - MAX_ACTIVE_RULES
+    if overflow <= 0:
+        return
+    scored = sorted(active, key=score_rule)
+    for rule in scored[:overflow]:
+        rule.status = "pending"
+
+
 def admit_rule(rule: DigestRule, store: DigestStore) -> str:
-    """A-MAC admission gate. Returns action taken: 'added', 'upvoted', 'rejected'.
+    """A-MAC admission gate. Returns 'added', 'upvoted', or 'rejected'.
 
     Quality gate BEFORE any rule enters store (arXiv:2505.16067).
     """
-    # Check for duplicate/similar existing rule
     existing = _find_duplicate(rule, store)
     if existing:
-        # ExpeL UPVOTE: reinforce existing rule
         existing.occurrence_count += 1
         existing.importance += 1
         existing.last_reinforced = rule.last_reinforced or datetime.now(timezone.utc).isoformat()
-        # Promote if threshold reached
         if existing.status == "pending" and existing.occurrence_count >= PROMOTION_COUNT:
             existing.status = "active"
         return "upvoted"
 
-    # Score the new rule
-    score = score_rule(rule)
-    if score < ADMISSION_THRESHOLD:
+    if score_rule(rule) < ADMISSION_THRESHOLD:
         return "rejected"
 
-    # Assign ID and add
     rule.id = store.next_id()
     store.strategy_rules.append(rule)
-
-    # Cap enforcement
-    active = store.active_rules()
-    if len(active) > MAX_ACTIVE_RULES:
-        # Demote lowest-scored active rule
-        scored = [(score_rule(r), r) for r in active]
-        scored.sort(key=lambda x: x[0])
-        scored[0][1].status = "pending"
-
+    _enforce_active_cap(store)
     return "added"
 
 
@@ -443,10 +565,51 @@ def admit_rule(rule: DigestRule, store: DigestStore) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _atomic_write_text(target: Path, data: str, encoding: str = "utf-8") -> None:
+    """Write `data` to `target` atomically with `fsync`.
+
+    `fsync` before `os.replace` guarantees the new bytes are on disk before
+    the rename, so a power-loss or OOM-kill leaves `target` either fully-old
+    or fully-new — never zeroed or partially truncated. `mkstemp` provides
+    collision-safe temp paths for concurrent hook processes.
+
+    The tmp filename keeps `target.name` as its SUFFIX so the tests' `endswith`
+    filesystem patches cover the temp write too (crash-safety is test-verified).
+    """
+    import tempfile
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".tmp.", suffix=target.name, dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def load_digest_store(project_dir: str = "") -> DigestStore:
-    """Load the digest store from disk."""
-    if not DIGEST_FILE.exists():
-        return DigestStore(project=project_dir)
+    """Load the digest store from disk, auto-migrating pre-hardening rules.
+
+    Failure modes (missing file, bad JSON, permission denied, disk error) all
+    return an empty store rather than crash — this code runs inside hook
+    critical path (PreCompact, Stop) where exceptions would kill the session.
+
+    Auto-migration: demotes any active rule that would not pass the current
+    admission gate (noise OR rejected by `_to_prohibition`), so users who
+    upgrade inherit a clean store with zero action required.
+    """
     try:
         data = json.loads(DIGEST_FILE.read_text(encoding="utf-8"))
         store = DigestStore(
@@ -457,14 +620,41 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
         )
         for rd in data.get("strategy_rules", []):
             store.strategy_rules.append(DigestRule(**rd))
+        for rule in store.strategy_rules:
+            if rule.status != "active":
+                continue
+            source = rule.evidence or rule.rule
+            if _is_system_noise(source) or _to_prohibition(source) == "":
+                rule.status = "pending"
+        _enforce_active_cap(store)
         return store
-    except (json.JSONDecodeError, TypeError, KeyError):
+    except (json.JSONDecodeError, TypeError, KeyError, OSError):
         return DigestStore(project=project_dir)
 
 
 def save_digest_store(store: DigestStore) -> None:
-    """Save the digest store to disk (JSON + human-readable markdown mirror)."""
+    """Save the digest store to disk (JSON + human-readable markdown mirror).
+
+    Atomic + lost-update-safe: writes via `_atomic_write_text` (tmp+os.replace)
+    so a mid-write crash leaves the target untouched, and re-reads the current
+    on-disk state just before writing to merge in any rules added by a
+    concurrent hook process (prevents PreCompact + Stop lost-update races).
+    """
     DIGEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Concurrent-save merge: if another process appended rules to the file
+    # between our load and this save, pull those rules in so they survive.
+    if DIGEST_FILE.exists():
+        try:
+            on_disk = json.loads(DIGEST_FILE.read_text(encoding="utf-8"))
+            known_rule_texts = {r.rule for r in store.strategy_rules}
+            for rd in on_disk.get("strategy_rules", []):
+                if rd.get("rule") not in known_rule_texts:
+                    store.strategy_rules.append(DigestRule(**rd))
+        except (json.JSONDecodeError, TypeError, KeyError, OSError):
+            # Corrupt or unreadable — skip merge, just overwrite with our state.
+            pass
+
     store.updated = datetime.now(timezone.utc).isoformat()
 
     data = {
@@ -475,7 +665,7 @@ def save_digest_store(store: DigestStore) -> None:
         "strategy_rules": [asdict(r) for r in store.strategy_rules],
         "failure_patterns": [],  # Reserved for future use
     }
-    DIGEST_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _atomic_write_text(DIGEST_FILE, json.dumps(data, indent=2))
 
     # Write human-readable markdown mirror
     _write_digest_md(store)
@@ -512,7 +702,7 @@ def _write_digest_md(store: DigestStore) -> None:
             lines.append(f"- **[{r.id}|{r.scope}]** {r.rule} (seen {r.occurrence_count}x)")
         lines.append("")
 
-    DIGEST_MD_FILE.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_text(DIGEST_MD_FILE, "\n".join(lines))
 
 
 def clear_digest_store() -> None:
@@ -590,46 +780,41 @@ def build_injection_text(store: DigestStore) -> str | None:
     if not active:
         return None
 
-    # Hard rules first, then soft, capped at MAX_ACTIVE_RULES
-    hard = [r for r in active if r.priority == "hard"]
-    soft = [r for r in active if r.priority == "soft"]
-    rules = (hard + soft)[:MAX_ACTIVE_RULES]
+    # Hard first, then soft up to the remaining cap slots.
+    hard = [r for r in active if r.priority == "hard"][:MAX_ACTIVE_RULES]
+    soft_budget = max(0, MAX_ACTIVE_RULES - len(hard))
+    soft = [r for r in active if r.priority == "soft"][:soft_budget]
 
-    lines = [
-        "BEHAVIORAL CONTRACT — Focus solely on these rules when applicable.",
-        "",
-    ]
-
+    lines = ["BEHAVIORAL CONTRACT — Focus solely on these rules when applicable.", ""]
     if hard:
         lines.append("PROHIBITIONS:")
-        for r in hard:
-            lines.append(_format_rule_4field(r))
+        lines.extend(_format_rule_4field(r) for r in hard)
         lines.append("")
-
-    soft_rules = [r for r in rules if r.priority == "soft"]
-    if soft_rules:
+    if soft:
         lines.append("PREFERENCES:")
-        for r in soft_rules:
-            lines.append(_format_rule_4field(r))
+        lines.extend(_format_rule_4field(r) for r in soft)
         lines.append("")
 
     return "\n".join(lines)
 
 
 def _get_memdir(cwd: str = "") -> Path | None:
-    """Find the Claude Code memory directory for the given project."""
+    """Find the Claude Code memory directory for the given project.
+
+    Delegates profile resolution to `session.get_projects_dir()` which honours
+    `CLAUDE_CONFIG_DIR` (used by the `claudes` profile launcher) before
+    falling back to `~/.claude`. Prevents cross-profile leaks.
+    """
+    import os
+    from .session import get_projects_dir
     if not cwd:
-        import os
         cwd = os.getcwd()
-    # Claude Code stores memories at ~/.claude/projects/<sanitized-cwd>/memory/
-    claude_dir = Path.home() / ".claude" / "projects"
+    claude_dir = get_projects_dir()
     if not claude_dir.exists():
         return None
-    # Sanitize cwd the same way CC does: replace / with -
     slug = cwd.lstrip("/").replace("/", "-")
     project_dir = claude_dir / f"-{slug}"
     if not project_dir.exists():
-        # Try finding by prefix match (CC may use different sanitization)
         for d in claude_dir.iterdir():
             if d.is_dir() and slug in d.name:
                 project_dir = d
@@ -676,7 +861,7 @@ type: feedback
 """
 
     digest_mem = mem_dir / "cozempic_digest.md"
-    digest_mem.write_text(content, encoding="utf-8")
+    _atomic_write_text(digest_mem, content)
 
     # Update MEMORY.md index if needed
     _update_memory_index(mem_dir)
