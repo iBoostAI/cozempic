@@ -761,42 +761,98 @@ def _detect_claude_flags(pid: int) -> str:
 
     Returns the flags portion of the command line (everything after 'claude'
     but excluding --resume/--continue and the session ID).
+
+    Uses psutil for accurate argv preservation (preserves spaces in values).
+    Falls back to ps -o args= with shlex.split when psutil is unavailable.
     """
+    import shlex
+
+    parts: list[str] = []
+
+    # Preferred path: psutil preserves original argv boundaries exactly.
     try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
-            capture_output=True, text=True, timeout=5,
-        )
-        args = result.stdout.strip()
-        if not args or "claude" not in args:
+        import psutil
+        parts = psutil.Process(pid).cmdline()
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: ps -o args= + shlex.split (loses space-boundary info on macOS).
+    if not parts:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "args="],
+                capture_output=True, text=True, timeout=5,
+            )
+            raw = result.stdout.strip()
+            if not raw or "claude" not in raw:
+                return ""
+            parts = shlex.split(raw)
+        except Exception:
             return ""
 
-        # Extract everything after "claude"
-        parts = args.split()
-        claude_idx = next((i for i, p in enumerate(parts) if p.endswith("claude")), -1)
-        if claude_idx < 0:
-            return ""
-
-        flags = parts[claude_idx + 1:]
-
-        # Remove resume/continue flags and session IDs (we'll add our own)
-        cleaned = []
-        skip_next = False
-        for f in flags:
-            if skip_next:
-                skip_next = False
-                continue
-            if f in ("--resume", "--continue", "-c"):
-                skip_next = True  # Skip the session ID that follows
-                continue
-            # Skip bare session ID args (UUID-like)
-            if len(f) >= 32 and "-" in f and not f.startswith("-"):
-                continue
-            cleaned.append(f)
-
-        return " ".join(cleaned)
-    except Exception:
+    if not parts:
         return ""
+
+    # Find 'claude' binary in the argv list.
+    claude_idx = next((i for i, p in enumerate(parts) if p.endswith("claude")), -1)
+    if claude_idx < 0:
+        return ""
+
+    tokens = parts[claude_idx + 1:]
+
+    # Walk tokens pairing --flags with their values.
+    # Consecutive non-flag tokens are joined as a single value (preserves paths
+    # with spaces when the argv source can provide them).
+    # Flags/values containing shell metacharacters are dropped to prevent injection.
+    _shell_metachars = set(';`$|()')
+    cleaned: list[str] = []
+    skip_count = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if skip_count > 0:
+            skip_count -= 1
+            i += 1
+            continue
+
+        # Skip resume/continue flags and their session ID argument
+        if tok in ("--resume", "--continue", "-c"):
+            skip_count = 1
+            i += 1
+            continue
+
+        # Skip bare UUID-like session ID args
+        if len(tok) >= 32 and "-" in tok and not tok.startswith("-"):
+            i += 1
+            continue
+
+        if tok.startswith("-"):
+            # Collect all following non-flag tokens as this flag's value
+            j = i + 1
+            while j < len(tokens) and not tokens[j].startswith("-"):
+                j += 1
+            value_tokens = tokens[i + 1:j]
+            value = " ".join(value_tokens) if value_tokens else ""
+
+            # Drop flag+value if value contains shell injection metacharacters
+            if any(c in _shell_metachars for c in value):
+                i = j
+                continue
+
+            if value:
+                cleaned.append(tok)
+                cleaned.append(shlex.quote(value))
+            else:
+                cleaned.append(tok)
+            i = j
+        else:
+            # Bare non-flag token (shouldn't be common after flag extraction)
+            if not any(c in _shell_metachars for c in tok):
+                cleaned.append(shlex.quote(tok))
+            i += 1
+
+    return " ".join(cleaned)
 
 
 def _detect_terminal_env() -> str:
