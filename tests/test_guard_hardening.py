@@ -1371,5 +1371,333 @@ class TestDiffCoverage_AtomicPidfile_AllErrnos(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Round 3 — RED tests for static-analysis + security findings
+# See STATIC_ANALYSIS_REPORT.md / SECURITY_REVIEW_REPORT.md.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# RED-R3-1 (STATIC-MED-1) — G4 placeholder race: pid=0 must never reach os.kill
+# ---------------------------------------------------------------------------
+class TestR3_1_PlaceholderPidZeroNeverSignaled(unittest.TestCase):
+    """When the G4 atomic-claim placeholder `"0"` is read by a concurrent loser,
+    `_is_guard_running_for_session` currently calls `os.kill(0, 0)`. On POSIX,
+    `os.kill(pid=0, sig=...)` signals the CALLER'S entire process group — not
+    an ancestor sentinel. Empirically:
+
+        >>> os.kill(0, 0)  # returns None, does NOT raise ProcessLookupError
+
+    The contract: the function must short-circuit on pid <= 0 BEFORE the
+    liveness probe. Today it only survives thanks to `_is_cozempic_guard_process(0)`
+    returning False downstream — a future refactor that removes the gate makes
+    this exploitable.
+    """
+
+    def setUp(self):
+        self.session_id = "33333333-aaaa-bbbb-cccc-000000000033"
+        from cozempic.guard import _pid_file_for_session
+        self.pid_path = _pid_file_for_session(self.session_id)
+        self.pid_path.write_text("0")
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+
+    def test_os_kill_never_called_with_pid_zero(self):
+        """`_is_guard_running_for_session` on a placeholder pidfile ("0") MUST NOT
+        invoke `os.kill(0, ...)` — pid 0 targets the caller's process group."""
+        from cozempic.guard import _is_guard_running_for_session
+
+        kill_calls = []
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+            return None
+
+        with patch("cozempic.guard.os.kill", side_effect=fake_kill):
+            _ = _is_guard_running_for_session(self.session_id)
+
+        pid_zero_calls = [(p, s) for (p, s) in kill_calls if p == 0]
+        self.assertEqual(
+            pid_zero_calls, [],
+            f"os.kill(0, ...) invoked during placeholder read — "
+            f"POSIX pgroup-broadcast footgun. Calls: {kill_calls}. "
+            f"Fix: short-circuit `if pid <= 0: pid_path.unlink(); return None` "
+            f"before the liveness probe.",
+        )
+
+    def test_returns_none_and_unlinks_on_placeholder(self):
+        """Positive regression: even after the fix, a placeholder-valued pidfile
+        must still resolve to `None` and be cleaned up."""
+        from cozempic.guard import _is_guard_running_for_session
+
+        # No mocks — exercise the real path. Must return None AND clean up.
+        result = _is_guard_running_for_session(self.session_id)
+        self.assertIsNone(
+            result,
+            f"placeholder pidfile not resolved to None: {result!r}",
+        )
+        self.assertFalse(
+            self.pid_path.exists(),
+            "placeholder pidfile must be unlinked after read",
+        )
+
+
+# ---------------------------------------------------------------------------
+# RED-R3-2 (STATIC-MED-2) — Windows taskkill regressions when ps is missing
+# ---------------------------------------------------------------------------
+class TestR3_2_WindowsTaskkillRegressionOnPsMissing(unittest.TestCase):
+    """`_is_claude_process` runs `subprocess.run(["ps", ...])`. On Windows,
+    `ps` does not exist → FileNotFoundError (OSError subclass) is caught →
+    helper returns False → every Windows taskkill path in
+    `_terminate_and_resume` (lines 973, 984) becomes a silent no-op.
+
+    Pre-fix Windows behaviour was "always taskkill"; post-fix Windows behaviour
+    is "never taskkill" — functional regression on Windows. Contract: either
+    use tasklist/WMIC on Windows, or fall back to liveness-only when identity
+    can't be determined (platform-aware probe).
+    """
+
+    def test_is_claude_process_has_windows_code_path(self):
+        """Static-source contract: the helper must NOT rely solely on POSIX `ps`
+        — either it branches on `platform.system()` to use tasklist/WMIC, or
+        it has an explicit "ps unavailable" fallback that returns True on
+        liveness (not silently False).
+
+        We detect this by checking that `_is_claude_process` either:
+          (a) references `tasklist` / `wmic` / `Get-Process` / `Win32_Process`
+              (Windows-specific probe), OR
+          (b) checks `platform.system()` and branches,
+        in its source.
+        """
+        import inspect
+        from cozempic.guard import _is_claude_process
+        src = inspect.getsource(_is_claude_process)
+
+        has_windows_probe = (
+            "tasklist" in src.lower()
+            or "wmic" in src.lower()
+            or "get-process" in src.lower()
+            or "win32_process" in src.lower()
+            or "platform.system" in src
+            or "sys.platform" in src
+        )
+        self.assertTrue(
+            has_windows_probe,
+            "_is_claude_process has no Windows-specific code path. On Windows, "
+            "`ps` raises FileNotFoundError → OSError caught → helper returns "
+            "False → every taskkill gate in _terminate_and_resume becomes a "
+            "no-op. Use tasklist or branch on platform.system().",
+        )
+
+    def test_helper_does_not_silently_return_false_when_ps_missing(self):
+        """Dynamic contract: if `subprocess.run(["ps", ...])` raises
+        FileNotFoundError (Windows), the helper MUST NOT silently return False
+        for a PID the caller believes is Claude. A valid fix either (a) falls
+        back to a Windows-native probe, or (b) returns True on liveness and
+        lets the caller proceed with taskkill (documented fallback)."""
+        from cozempic.guard import _is_claude_process
+
+        def fake_run(cmd, *a, **kw):
+            cmd_list = list(cmd) if isinstance(cmd, (list, tuple)) else [cmd]
+            if cmd_list and cmd_list[0] == "ps":
+                raise FileNotFoundError(2, "ps not found (simulated Windows)")
+            # If the fix uses a Windows probe (tasklist), return a matching row
+            if cmd_list and cmd_list[0] in ("tasklist", "wmic"):
+                m = MagicMock()
+                m.returncode = 0
+                m.stdout = "claude.exe 12345 Console 1 123,456 K"
+                return m
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            return m
+
+        with (
+            patch("cozempic.guard.subprocess.run", side_effect=fake_run),
+            patch("cozempic.guard.platform.system", return_value="Windows"),
+        ):
+            got = _is_claude_process(12345)
+
+        # A correct fix should return True for a live Claude PID on Windows —
+        # either via tasklist probe or liveness fallback. The current code
+        # catches OSError → returns False → regression.
+        self.assertTrue(
+            got,
+            "Windows: ps is missing (FileNotFoundError). Current impl catches "
+            "OSError and returns False → taskkill never fires. Fix must "
+            "branch on platform (tasklist/wmic) or fall back to liveness.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# RED-R3-3 (STATIC-LOW-3) — Regex accepts trailing newline (re.match vs fullmatch)
+# ---------------------------------------------------------------------------
+class TestR3_3_BinaryRegexRejectsTrailingNewline(unittest.TestCase):
+    """`_is_cozempic_guard_process` uses `re.match(r"^python(\\d+(\\.\\d+)*)?$", binary)`.
+    Python's `re.match` anchors at start; `$` matches before a trailing newline
+    by default. So `binary == "python3\\n"` PASSES the regex:
+
+        >>> bool(re.match(r"^python(\\d+(\\.\\d+)*)?$", "python3\\n"))
+        True
+
+    Fix: `re.fullmatch` OR add `re.DOTALL`+anchor OR explicit `not s.endswith("\\n")`.
+    """
+
+    def test_rejects_binary_with_trailing_newline_injected(self):
+        """Dynamic defence-in-depth: if a future refactor bypasses `args.strip()`
+        / `args.split()` and `tokens[0]` contains a literal `"python3\\n"`, the
+        binary gate MUST still reject it. This is the exact contract from
+        STATIC-LOW-3: `re.match + $` accepts `"python3\\n"` because `$` matches
+        before the trailing newline; `re.fullmatch` does not.
+
+        We patch `args.split` indirectly: mock `subprocess.run` to return an
+        args line whose first token ends with `\\n` after our stub's own
+        tokenisation. Simulate this by overriding `str.split` via monkey-patching
+        the helper's token list. Cleanest: patch `Path.name` on the first token
+        so the binary-under-test becomes `"python3\\n"`.
+        """
+        import inspect
+        from cozempic.guard import _is_cozempic_guard_process
+        src = inspect.getsource(_is_cozempic_guard_process)
+
+        # The function must use re.fullmatch (or explicit \n rejection on the
+        # binary string) — NOT re.match + $. This is a stricter static check
+        # than the companion test below: we require fullmatch or equivalent
+        # explicit newline rejection on the BINARY specifically.
+        uses_fullmatch = "re.fullmatch(" in src
+        has_explicit_binary_newline_guard = (
+            "binary.endswith" in src
+            or 'binary.rstrip("\\n")' in src
+            or "if \"\\n\" in binary" in src
+            or "\"\\n\" not in binary" in src
+        )
+        self.assertTrue(
+            uses_fullmatch or has_explicit_binary_newline_guard,
+            "_is_cozempic_guard_process uses `re.match(..., $)` which accepts "
+            "trailing `\\n` in the binary (Python regex quirk: `$` matches "
+            "before a trailing newline unless re.fullmatch is used). Fix: "
+            "switch to `re.fullmatch(...)` in guard.py:1344.",
+        )
+
+    def test_re_match_dollar_accepts_trailing_newline_regression(self):
+        """Regression anchor: proves Python's `re.match(r'...$', 'x\\n')`
+        silently accepts the newline. If future Python changes this, the fix
+        becomes redundant — but the test still documents WHY fullmatch is
+        required."""
+        import re
+        pattern = r"^python(\d+(\.\d+)*)?$"
+        # Python semantics: `re.match` with `$` accepts trailing `\n`.
+        # `re.fullmatch` does not.
+        self.assertTrue(
+            bool(re.match(pattern, "python3\n")),
+            "Python regex semantics assumption violated: re.match + $ used to "
+            "accept trailing newline. If this assertion fails, the STATIC-LOW-3 "
+            "bug class has been closed by Python itself.",
+        )
+        self.assertFalse(
+            bool(re.fullmatch(pattern, "python3\n")),
+            "Python regex semantics assumption violated: re.fullmatch should "
+            "reject trailing newline.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# RED-R3-4 (SECURITY-THEORETICAL) — POSIX plain-terminal SIGTERM inner re-check
+# ---------------------------------------------------------------------------
+class TestR3_4_PosixPlainTerminalSigtermHasInnerReverify(unittest.TestCase):
+    """The POSIX plain-terminal path in `_terminate_and_resume` issues the
+    FIRST SIGTERM at guard.py:977 inside `try: ... except (ProcessLookupError,
+    PermissionError, OSError): pass` — NO inner `_is_claude_process` re-check.
+
+    Symmetry gaps with the rest of the function:
+      - tmux SIGTERM @ line 933 — has inner re-check (good)
+      - screen SIGTERM @ line 958 — has inner re-check (good)
+      - Windows taskkill @ line 973 — has inner re-check (good, after R2 fix)
+      - Windows taskkill /F @ line 984 — has inner re-check (good, after R2 fix)
+      - POSIX SIGKILL @ line 988 — has inner re-check (good)
+      - **POSIX SIGTERM @ line 977 — NO inner re-check (gap)**
+
+    Race window: between the outer `_is_claude_process` at line 914 and the
+    SIGTERM at line 977, the code runs `_detect_claude_flags` (subprocess call),
+    env-var reads, terminal-env detection. Window ≥ 100ms in practice. If
+    Claude exits + PID recycles in that window, SIGTERM lands on an unrelated
+    POSIX process.
+    """
+
+    def test_sigterm_skipped_when_identity_fails_mid_race(self):
+        """Outer check returns True (Claude alive), then identity flips to
+        False before the plain-terminal SIGTERM. SIGTERM MUST NOT fire."""
+        from cozempic.guard import _terminate_and_resume
+
+        # Sequence: outer check at line 914 → True.
+        # Subsequent _is_claude_process calls → False (PID recycled).
+        call_sequence = [True, False, False, False, False]
+
+        def fake_is_claude_process(pid):
+            return call_sequence.pop(0) if call_sequence else False
+
+        kill_calls = []
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+            return None
+
+        with (
+            patch("cozempic.guard._detect_terminal_env", return_value="plain"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.platform.system", return_value="Linux"),
+            patch("cozempic.guard._is_claude_process",
+                  side_effect=fake_is_claude_process),
+            patch("cozempic.guard._wait_for_exit", return_value=True),
+            patch("cozempic.guard.os.kill", side_effect=fake_kill),
+            patch("cozempic.guard._spawn_reload_watcher"),
+        ):
+            _terminate_and_resume(51337, "/tmp/proj", session_id="sess-r3-4")
+
+        sigterm_calls = [
+            (p, s) for (p, s) in kill_calls
+            if p == 51337 and s == signal.SIGTERM
+        ]
+        self.assertEqual(
+            sigterm_calls, [],
+            f"POSIX plain-terminal SIGTERM fired after identity check returned "
+            f"False mid-race. Calls: {kill_calls}. Gap: guard.py:977 has no "
+            f"inner `if _is_claude_process(claude_pid):` guard — unlike the "
+            f"tmux/screen/SIGKILL paths. Fix: mirror those guards.",
+        )
+
+    def test_sigterm_fires_when_identity_remains_valid(self):
+        """Positive: when identity stays True across the race window, SIGTERM
+        MUST fire (guards against an over-protective fix that skips SIGTERM
+        entirely)."""
+        from cozempic.guard import _terminate_and_resume
+
+        kill_calls = []
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+            return None
+
+        with (
+            patch("cozempic.guard._detect_terminal_env", return_value="plain"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.platform.system", return_value="Linux"),
+            patch("cozempic.guard._is_claude_process", return_value=True),
+            patch("cozempic.guard._wait_for_exit", return_value=True),
+            patch("cozempic.guard.os.kill", side_effect=fake_kill),
+            patch("cozempic.guard._spawn_reload_watcher"),
+        ):
+            _terminate_and_resume(62424, "/tmp/proj", session_id="sess-r3-4b")
+
+        sigterm_calls = [
+            (p, s) for (p, s) in kill_calls
+            if p == 62424 and s == signal.SIGTERM
+        ]
+        self.assertGreaterEqual(
+            len(sigterm_calls), 1,
+            "POSIX plain-terminal SIGTERM did not fire even though identity "
+            "stayed True. Fix over-protects and leaves Claude running.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
