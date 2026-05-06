@@ -22,8 +22,15 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+
+# Per-session spawn lock: prevents a concurrent _is_guard_running_for_session
+# from treating a live O_CREAT placeholder as a stale file (within the same
+# process). Keyed by session_id to avoid false contention across sessions.
+_spawn_locks: dict[str, threading.Lock] = {}
+_spawn_locks_mu = threading.Lock()
 
 from ._validation import ConfigError
 from .executor import run_prescription
@@ -1094,6 +1101,7 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
 
     Returns the PID if running, None otherwise.
     """
+    norm_sid = _normalize_session_id(session_id)
     pid_path = _pid_file_for_session(session_id)
     if not pid_path.exists():
         return None
@@ -1101,6 +1109,17 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     try:
         pid = int(pid_path.read_text().strip())
         if pid <= 0:
+            # Guard against PID-reuse footgun: os.kill(0, sig) broadcasts to
+            # the caller's process group rather than targeting a sentinel.
+            # If a concurrent start_guard_daemon in THIS process holds the
+            # session spawn lock, the placeholder is live — skip the unlink.
+            with _spawn_locks_mu:
+                lock = _spawn_locks.get(norm_sid)
+            if lock is not None and not lock.acquire(blocking=False):
+                # Lock is held → spawner is in-flight; placeholder is live.
+                return None
+            if lock is not None:
+                lock.release()
             pid_path.unlink(missing_ok=True)
             return None
         os.kill(pid, 0)
@@ -1112,6 +1131,7 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     except (ValueError, ProcessLookupError, PermissionError):
         pid_path.unlink(missing_ok=True)
         return None
+
 
 
 # Backward compat aliases
@@ -1221,44 +1241,87 @@ def start_guard_daemon(
     if claude_pid is None:
         claude_pid = find_claude_pid()
 
+    # Acquire the per-session spawn lock before O_CREAT so that a concurrent
+    # _is_guard_running_for_session (same process) sees the lock is held and skips
+    # the unlink of our in-flight "0" placeholder. Released after the real PID
+    # is committed. File-level O_CREAT|O_EXCL still guards cross-process races.
+    norm_sid = _normalize_session_id(session_id) if session_id else ""
+    with _spawn_locks_mu:
+        if norm_sid not in _spawn_locks:
+            _spawn_locks[norm_sid] = threading.Lock()
+        spawn_lock = _spawn_locks[norm_sid]
+    spawn_lock.acquire()
+
     # Atomically claim the pid slot before spawning (O_CREAT|O_EXCL prevents TOCTOU).
-    # If EEXIST, another concurrent starter won the race — return already_running.
     # Other OSErrors (ENOSPC, EROFS, EACCES) are non-fatal: return started=False
     # with a reason so the non-interactive SessionStart hook doesn't crash silently.
+    _claim_result: dict | None = None
     try:
-        fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, b"0")  # placeholder; real PID written after Popen
-        os.close(fd)
-    except (FileExistsError, OSError) as _e:
-        if not isinstance(_e, FileExistsError):
-            return {"started": False, "reason": f"pidfile: {_e}"}
-        # Re-read and verify to handle the case where the winner's daemon is up
-        existing_pid = _is_guard_running_for_session(session_id) if session_id else None
-        if existing_pid:
-            return {
-                "started": False,
-                "pid": existing_pid,
-                "pid_file": str(pid_path),
-                "log_file": None,
-                "already_running": True,
-            }
-        # Stale placeholder (previous crash before real PID was written) — remove and retry once
-        pid_path.unlink(missing_ok=True)
         try:
             fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, b"0")
+            os.write(fd, b"0")  # placeholder; real PID written after Popen
             os.close(fd)
-        except (FileExistsError, OSError) as _e2:
-            if not isinstance(_e2, FileExistsError):
-                return {"started": False, "reason": f"pidfile: {_e2}"}
-            existing_pid = _is_guard_running_for_session(session_id) if session_id else None
-            return {
-                "started": False,
-                "pid": existing_pid,
-                "pid_file": str(pid_path),
-                "log_file": None,
-                "already_running": True,
-            }
+        except (FileExistsError, OSError) as _e:
+            if not isinstance(_e, FileExistsError):
+                _claim_result = {"started": False, "reason": f"pidfile: {_e}"}
+            else:
+                # Peek at what the existing file holds to decide the retry strategy.
+                try:
+                    _raw = pid_path.read_text().strip() if pid_path.exists() else ""
+                    _on_disk_pid = int(_raw) if _raw else 0
+                except (ValueError, OSError):
+                    _on_disk_pid = 0
+                if _on_disk_pid > 0:
+                    # File holds a real PID (> 0): a concurrent winner just wrote it.
+                    # Trust the write — don't call _is_guard_running_for_session (it
+                    # would probe os.kill which may fail for a just-spawned process,
+                    # unlink the file, and break the invariant). Dead-guard detection
+                    # happens on the NEXT call to start_guard_daemon.
+                    _claim_result = {
+                        "started": False,
+                        "pid": _on_disk_pid,
+                        "pid_file": str(pid_path),
+                        "log_file": None,
+                        "already_running": True,
+                    }
+                else:
+                    # File holds a placeholder (pid <= 0): either a concurrent spawn's
+                    # in-flight "0" or a stale placeholder from a previous crash.
+                    # Re-read via the full helper which handles the spawn-lock check.
+                    existing_pid = _is_guard_running_for_session(session_id) if session_id else None
+                    if existing_pid:
+                        _claim_result = {
+                            "started": False,
+                            "pid": existing_pid,
+                            "pid_file": str(pid_path),
+                            "log_file": None,
+                            "already_running": True,
+                        }
+                    else:
+                        # Stale placeholder (previous crash before real PID was written) — remove and retry once
+                        pid_path.unlink(missing_ok=True)
+                        try:
+                            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                            os.write(fd, b"0")
+                            os.close(fd)
+                        except (FileExistsError, OSError) as _e2:
+                            if not isinstance(_e2, FileExistsError):
+                                _claim_result = {"started": False, "reason": f"pidfile: {_e2}"}
+                            else:
+                                existing_pid = _is_guard_running_for_session(session_id) if session_id else None
+                                _claim_result = {
+                                    "started": False,
+                                    "pid": existing_pid,
+                                    "pid_file": str(pid_path),
+                                    "log_file": None,
+                                    "already_running": True,
+                                }
+    except Exception:
+        spawn_lock.release()
+        raise
+    if _claim_result is not None:
+        spawn_lock.release()
+        return _claim_result
 
     # Build the guard command
     cmd_parts = [
@@ -1308,6 +1371,9 @@ def start_guard_daemon(
     tmp_path = pid_path.with_suffix(".pid.tmp")
     tmp_path.write_text(str(proc.pid))
     tmp_path.replace(pid_path)
+    # Release the spawn lock now that the real PID is committed. Any concurrent
+    # _is_guard_running_for_session can now read the valid PID > 0.
+    spawn_lock.release()
 
     return {
         "started": True,
