@@ -1133,7 +1133,6 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
         return None
 
 
-
 # Backward compat aliases
 def _pid_file(cwd: str) -> Path:
     return _pid_file_for_cwd(cwd)
