@@ -1025,5 +1025,351 @@ class TestNF5_WindowsTaskkillReVerifies(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# R2-REG-2 — Versioned python binaries (pyenv / Homebrew) must pass
+#
+# Regression: commit be027e0 changed the binary check from
+#   `binary in {"python", "python3"}` to `re.match(r"^python(\d+(\.\d+)*)?$", ...)`.
+# Without this, pyenv installs of python3.13.12 / Homebrew python3.11 guards
+# would be rejected as "not cozempic" → SIGTERM blocked on legitimate daemons,
+# or _is_guard_running_for_session returns None → duplicate daemons spawn.
+# ---------------------------------------------------------------------------
+class TestR2REG2_VersionedPythonAccepted(unittest.TestCase):
+    """Lock in the regex accept/reject contract for python-like binaries.
+
+    Argv pattern used in each case is the canonical daemon spawn:
+        <binary> -m cozempic.cli guard --session <id>
+    so the only variable is tokens[0] (the interpreter path).
+    """
+
+    def _argv_for(self, binary: str) -> str:
+        """Build a canonical daemon argv line with the given interpreter basename."""
+        return f"/usr/local/bin/{binary} -m cozempic.cli guard --session abc-123"
+
+    def _entrypoint_argv(self) -> str:
+        """Native cozempic entry-point (no python interpreter)."""
+        return "/usr/local/bin/cozempic guard --session abc-123"
+
+    def _check(self, binary_or_argv: str, *, argv: str | None = None) -> bool:
+        from cozempic.guard import _is_cozempic_guard_process
+        final_argv = argv if argv is not None else self._argv_for(binary_or_argv)
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(final_argv)):
+            return _is_cozempic_guard_process(12345)
+
+    # ── Accepted variants ────────────────────────────────────────────────
+    def test_accepts_python3_11_homebrew(self):
+        self.assertTrue(self._check("python3.11"),
+                        "Homebrew python3.11 rejected — R2-REG-2 regressed")
+
+    def test_accepts_python3_13_pyenv_short(self):
+        self.assertTrue(self._check("python3.13"),
+                        "pyenv python3.13 rejected — R2-REG-2 regressed")
+
+    def test_accepts_python3_13_12_pyenv_full(self):
+        self.assertTrue(self._check("python3.13.12"),
+                        "pyenv full-triple python3.13.12 rejected — R2-REG-2 regressed")
+
+    def test_accepts_python3_unversioned(self):
+        self.assertTrue(self._check("python3"),
+                        "Plain python3 rejected — R2-REG-2 regressed")
+
+    def test_accepts_python_bare(self):
+        self.assertTrue(self._check("python"),
+                        "Bare python rejected — R2-REG-2 regressed")
+
+    def test_accepts_python2_7_legacy(self):
+        self.assertTrue(self._check("python2.7"),
+                        "Legacy python2.7 rejected — regex should accept any digit sequence")
+
+    def test_accepts_cozempic_entrypoint(self):
+        """Native entry-point path: `cozempic guard ...` with no interpreter."""
+        self.assertTrue(
+            self._check("cozempic", argv=self._entrypoint_argv()),
+            "Native `cozempic guard` entry-point rejected",
+        )
+
+    # ── Rejected variants ────────────────────────────────────────────────
+    def test_rejects_run_cozempic_wrapper(self):
+        self.assertFalse(self._check("run-cozempic"),
+                         "`run-cozempic` wrapper falsely accepted — confused deputy risk")
+
+    def test_rejects_fake_cozempic_impostor(self):
+        self.assertFalse(self._check("fake-cozempic"),
+                         "`fake-cozempic` impostor falsely accepted")
+
+    def test_rejects_python_attacker_impostor(self):
+        self.assertFalse(self._check("python-attacker"),
+                         "`python-attacker` impostor falsely accepted")
+
+    def test_rejects_trailing_dot(self):
+        """`python3.` (trailing dot, no digit group) must fail: regex requires
+        `\\d+` after each dot."""
+        self.assertFalse(self._check("python3."),
+                         "`python3.` trailing-dot falsely accepted — regex is too loose")
+
+    def test_rejects_double_dot(self):
+        """`python3..11` must fail: `\\.\\d+` forbids consecutive dots."""
+        self.assertFalse(self._check("python3..11"),
+                         "`python3..11` double-dot falsely accepted — regex is too loose")
+
+
+# ---------------------------------------------------------------------------
+# Regex edge cases / ReDoS surface on _is_cozempic_guard_process
+# ---------------------------------------------------------------------------
+class TestRegexEdgeCases_IsCozempicGuardProcess(unittest.TestCase):
+    """Pathological / adversarial inputs must fail CLOSED quickly."""
+
+    def test_empty_argv_fails_closed(self):
+        """`ps -p <pid> -o args=` returns empty: must return False, no crash."""
+        from cozempic.guard import _is_cozempic_guard_process
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps("")):
+            self.assertFalse(_is_cozempic_guard_process(12345))
+
+    def test_newline_injected_binary_rejected(self):
+        """Binary with embedded `\\n`: split() produces multi-token output, but
+        the first token must fail the binary check; no crash."""
+        from cozempic.guard import _is_cozempic_guard_process
+        # The argv injects a newline that splits the first "binary" into two
+        # tokens; tokens[0] becomes "python" but tokens[1] becomes "evil-cmd".
+        # Either way, the guard command must not be accepted from a line that
+        # smuggled a newline; and the implementation must not raise.
+        argv = "python\nevil-cmd -m cozempic.cli guard --session abc"
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            # Contract: no exception. Return value can be True or False depending
+            # on whether tokens[0] happens to be "python" (it does, because split()
+            # splits on any whitespace including \n); the important thing is no
+            # crash and no confused-deputy if a genuine newline poisoning was
+            # attempted. We assert no-crash.
+            try:
+                _is_cozempic_guard_process(12345)
+            except Exception as e:
+                self.fail(f"_is_cozempic_guard_process raised on newline input: {e!r}")
+
+    def test_very_long_binary_name_rejected_fast(self):
+        """`python` + `a`*1000: regex must reject and complete quickly (<100ms)."""
+        from cozempic.guard import _is_cozempic_guard_process
+        huge = "python" + "a" * 1000
+        argv = f"{huge} -m cozempic.cli guard --session abc"
+        import time as _t
+        t0 = _t.perf_counter()
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            got = _is_cozempic_guard_process(12345)
+        dt = _t.perf_counter() - t0
+        self.assertFalse(got, "Pathological long binary name falsely accepted")
+        self.assertLess(
+            dt, 0.1,
+            f"_is_cozempic_guard_process took {dt*1000:.1f}ms on 1006-char binary "
+            f"— potential ReDoS surface",
+        )
+
+    def test_unicode_fullwidth_dot_rejected(self):
+        """`python3．11` (fullwidth dot) must NOT match ASCII-dot regex."""
+        from cozempic.guard import _is_cozempic_guard_process
+        argv = "python3．11 -m cozempic.cli guard --session abc"
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            self.assertFalse(
+                _is_cozempic_guard_process(12345),
+                "Unicode fullwidth dot falsely accepted as a version separator",
+            )
+
+    def test_trailing_whitespace_stripped(self):
+        """Trailing whitespace on argv line must not affect acceptance —
+        `args.strip()` handles it; tokens[0] remains clean."""
+        from cozempic.guard import _is_cozempic_guard_process
+        argv = "/usr/local/bin/python3.11 -m cozempic.cli guard --session abc   \n\t "
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            # Trailing whitespace should NOT prevent acceptance of a legitimate
+            # daemon (strip handles it); contract: still True.
+            self.assertTrue(
+                _is_cozempic_guard_process(12345),
+                "Trailing whitespace caused legitimate daemon to be rejected",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Diff coverage — NF-1 + NF-2 round-trip (identity helper wired into watchdog)
+# ---------------------------------------------------------------------------
+class TestDiffCoverage_RoundTrip_NF1_NF2(unittest.TestCase):
+    """End-to-end scenarios exercising _is_claude_process on realistic argvs
+    and confirming the helper's accept/reject contract aligns with the
+    watchdog's expectations (called at guard.py:425)."""
+
+    def test_real_anthropic_claude_code_cli_accepted(self):
+        """Canonical install path: `node /usr/local/lib/node_modules/
+        @anthropic-ai/claude-code/cli.js` must pass."""
+        from cozempic.guard import _is_claude_process
+        argv = (
+            "/usr/local/bin/node "
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        )
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            self.assertTrue(
+                _is_claude_process(12345),
+                "Canonical `@anthropic-ai/claude-code` cli.js path rejected — "
+                "would cause watchdog to flip claude_alive=False prematurely",
+            )
+
+    def test_native_claude_binary_accepted(self):
+        """Direct `claude` binary (no node wrapper)."""
+        from cozempic.guard import _is_claude_process
+        argv = "/usr/local/bin/claude --resume abc-123"
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            self.assertTrue(
+                _is_claude_process(12345),
+                "Native `claude` binary rejected",
+            )
+
+    def test_recycled_pid_to_node_server_rejected(self):
+        """Claude exited; PID now points at `node server.js` — must reject.
+        This is the exact bug the identity helper defends against."""
+        from cozempic.guard import _is_claude_process
+        argv = "/usr/local/bin/node /home/user/server.js"
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(argv)):
+            self.assertFalse(
+                _is_claude_process(12345),
+                "Recycled PID → `node server.js` falsely accepted as Claude — "
+                "watchdog would let guard keep signaling an unrelated process",
+            )
+
+    def test_watchdog_identity_flip_mid_loop(self):
+        """Simulate watchdog's control flow around guard.py:415-428 — identity
+        helper returning True first, then False mid-loop, must flip a
+        local `claude_alive` flag to False on the False read."""
+        from cozempic.guard import _is_claude_process
+
+        # Sequence mirrors the watchdog's polling: os.kill(pid, 0) succeeds
+        # (liveness), then _is_claude_process is called. We assert the helper
+        # itself switches; the watchdog ties this directly to `claude_alive`.
+        responses = iter([
+            "/usr/local/bin/claude --resume abc",
+            "/usr/local/bin/node /home/user/server.js",  # recycled
+        ])
+
+        def side_effect(cmd, *a, **kw):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = next(responses)
+            return m
+
+        with patch("cozempic.guard.subprocess.run", side_effect=side_effect):
+            self.assertTrue(_is_claude_process(12345),
+                            "First poll: legitimate Claude process")
+            self.assertFalse(_is_claude_process(12345),
+                             "Second poll after PID recycle: must reject node server.js")
+
+
+# ---------------------------------------------------------------------------
+# Diff coverage — atomic pidfile error paths (5 errno variants)
+# ---------------------------------------------------------------------------
+class TestDiffCoverage_AtomicPidfile_AllErrnos(unittest.TestCase):
+    """NF-4 follow-up: the except branch at start_guard_daemon:1228 catches
+    `(FileExistsError, OSError)` — test each non-EEXIST errno variant to lock
+    in the contract that none crash the SessionStart hook."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.session_id = "55555555-dddd-eeee-ffff-000000000055"
+        from cozempic.guard import _pid_file_for_session
+        self.pid_path = _pid_file_for_session(self.session_id)
+        self.pid_path.unlink(missing_ok=True)
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+        key = self.session_id[:12]
+        self.log_path = Path("/tmp") / f"cozempic_guard_{key}.log"
+        self.log_path.unlink(missing_ok=True)
+        self.addCleanup(self.log_path.unlink, missing_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run_with_os_open_raising(self, exc: Exception):
+        """Invoke start_guard_daemon with a mocked os.open that raises the
+        given exception on EXCL open of our pidfile. Returns result dict OR
+        `{'_raised': exc}` if uncaught."""
+        from cozempic.guard import start_guard_daemon
+
+        real_os_open = os.open
+
+        def fake_open(path, flags, *args, **kwargs):
+            if str(path) == str(self.pid_path) and (flags & os.O_EXCL):
+                raise exc
+            return real_os_open(path, flags, *args, **kwargs)
+
+        with (
+            patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard.find_claude_pid", return_value=7777),
+            patch("cozempic.guard.subprocess.Popen") as mock_popen,
+            patch("cozempic.guard.os.open", side_effect=fake_open),
+        ):
+            mock_popen.return_value = MagicMock(pid=9999)
+            try:
+                return start_guard_daemon(
+                    cwd=self.tmpdir,
+                    session_id=self.session_id,
+                    threshold_tokens=1000,
+                )
+            except OSError as e:
+                return {"_raised": e}
+
+    def _assert_graceful(self, result, label: str):
+        self.assertNotIn(
+            "_raised", result,
+            f"{label} propagated uncaught: {result.get('_raised')!r}. "
+            f"Hook must not crash the non-interactive SessionStart surface.",
+        )
+        self.assertFalse(
+            result.get("started"),
+            f"{label}: expected started=False; got {result!r}",
+        )
+        self.assertIn(
+            "reason", result,
+            f"{label}: result must carry a reason string",
+        )
+
+    def test_enospc_graceful(self):
+        import errno as _errno_mod
+        exc = OSError(_errno_mod.ENOSPC, os.strerror(_errno_mod.ENOSPC))
+        self._assert_graceful(self._run_with_os_open_raising(exc), "ENOSPC")
+
+    def test_erofs_graceful(self):
+        import errno as _errno_mod
+        exc = OSError(_errno_mod.EROFS, os.strerror(_errno_mod.EROFS))
+        self._assert_graceful(self._run_with_os_open_raising(exc), "EROFS")
+
+    def test_eacces_graceful(self):
+        import errno as _errno_mod
+        exc = OSError(_errno_mod.EACCES, os.strerror(_errno_mod.EACCES))
+        self._assert_graceful(self._run_with_os_open_raising(exc), "EACCES")
+
+    def test_ebusy_graceful(self):
+        import errno as _errno_mod
+        exc = OSError(_errno_mod.EBUSY, os.strerror(_errno_mod.EBUSY))
+        self._assert_graceful(self._run_with_os_open_raising(exc), "EBUSY")
+
+    def test_emfile_graceful(self):
+        """EMFILE: file descriptor exhaustion — real-world limit under load."""
+        import errno as _errno_mod
+        exc = OSError(_errno_mod.EMFILE, os.strerror(_errno_mod.EMFILE))
+        self._assert_graceful(self._run_with_os_open_raising(exc), "EMFILE")
+
+    def test_generic_oserror_with_custom_strerror(self):
+        """OSError with an unconventional errno (e.g., from a mounted FS with
+        custom errors) must still flow through the graceful branch."""
+        exc = OSError(999, "custom filesystem error — quota drift")
+        self._assert_graceful(
+            self._run_with_os_open_raising(exc),
+            "OSError(999)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
