@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -1336,9 +1337,11 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         if not tokens:
             return False
         binary = Path(tokens[0]).name.lower()
-        # tokens[0] must be a python interpreter or cozempic entry-point (not
-        # run-cozempic, fake-cozempic, etc.)
-        if binary not in ("python", "python3", "cozempic"):
+        # tokens[0] must be a python interpreter (any minor/patch version) or
+        # the cozempic entry-point. Rejects `run-cozempic`, `fake-cozempic`,
+        # `python-attacker`. Accepts `python3.11`, `python3.13.12`, etc. used
+        # by pyenv / Homebrew / distro packaging.
+        if not (binary == "cozempic" or re.match(r"^python(\d+(\.\d+)*)?$", binary)):
             return False
         # "cozempic.cli" and "guard" must appear as discrete arg tokens, not as
         # substrings in filenames/paths (grep, less, vim on our source tree).
