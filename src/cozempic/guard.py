@@ -18,11 +18,19 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+
+# Per-session spawn lock: prevents a concurrent _is_guard_running_for_session
+# from treating a live O_CREAT placeholder as a stale file (within the same
+# process). Keyed by session_id to avoid false contention across sessions.
+_spawn_locks: dict[str, threading.Lock] = {}
+_spawn_locks_mu = threading.Lock()
 
 from ._validation import ConfigError
 from .executor import run_prescription
@@ -416,6 +424,16 @@ def start_guard(
                     os.kill(claude_pid, 0)
                 except (ProcessLookupError, PermissionError):
                     claude_alive = False
+                else:
+                    # Liveness confirmed — also verify PID identity to guard against
+                    # PID reuse (daemon started hours ago; original Claude exited and
+                    # kernel recycled its PID to an unrelated process).
+                    try:
+                        if not _is_claude_process(claude_pid):
+                            claude_alive = False
+                    except ProcessLookupError:
+                        claude_alive = False
+                if not claude_alive:
                     print(f"  [{_now()}] Claude process exited (PID {claude_pid}). Final checkpoint...")
                     checkpoint_team(session_path=session_path, quiet=False)
                     print(f"  Guard stopping (Claude exited).")
@@ -708,6 +726,25 @@ def guard_prune_cycle(
     return result
 
 
+def _is_cozempic_watcher_process(pid: int) -> bool:
+    """Verify that `pid` is a cozempic reload watcher (bash + cozempic watcher script).
+
+    Guards against false positives from pgrep substring matching.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        args = (result.stdout or "").strip()
+        # Real watcher script contains both "bash" and "Cozempic guard resumed Claude"
+        return "bash" in args and "Cozempic guard resumed Claude" in args
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def _cleanup_stale_watchers() -> None:
     """Kill stale reload watchers from previous Cozempic versions.
 
@@ -722,7 +759,9 @@ def _cleanup_stale_watchers() -> None:
         for pid_str in result.stdout.strip().split("\n"):
             if pid_str:
                 try:
-                    os.kill(int(pid_str), signal.SIGTERM)
+                    pid = int(pid_str)
+                    if _is_cozempic_watcher_process(pid):
+                        os.kill(pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, ValueError):
                     pass
     except Exception:
@@ -740,42 +779,98 @@ def _detect_claude_flags(pid: int) -> str:
 
     Returns the flags portion of the command line (everything after 'claude'
     but excluding --resume/--continue and the session ID).
+
+    Uses psutil for accurate argv preservation (preserves spaces in values).
+    Falls back to ps -o args= with shlex.split when psutil is unavailable.
     """
+    import shlex
+
+    parts: list[str] = []
+
+    # Preferred path: psutil preserves original argv boundaries exactly.
     try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
-            capture_output=True, text=True, timeout=5,
-        )
-        args = result.stdout.strip()
-        if not args or "claude" not in args:
+        import psutil
+        parts = psutil.Process(pid).cmdline()
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: ps -o args= + shlex.split (loses space-boundary info on macOS).
+    if not parts:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "args="],
+                capture_output=True, text=True, timeout=5,
+            )
+            raw = result.stdout.strip()
+            if not raw or "claude" not in raw:
+                return ""
+            parts = shlex.split(raw)
+        except Exception:
             return ""
 
-        # Extract everything after "claude"
-        parts = args.split()
-        claude_idx = next((i for i, p in enumerate(parts) if p.endswith("claude")), -1)
-        if claude_idx < 0:
-            return ""
-
-        flags = parts[claude_idx + 1:]
-
-        # Remove resume/continue flags and session IDs (we'll add our own)
-        cleaned = []
-        skip_next = False
-        for f in flags:
-            if skip_next:
-                skip_next = False
-                continue
-            if f in ("--resume", "--continue", "-c"):
-                skip_next = True  # Skip the session ID that follows
-                continue
-            # Skip bare session ID args (UUID-like)
-            if len(f) >= 32 and "-" in f and not f.startswith("-"):
-                continue
-            cleaned.append(f)
-
-        return " ".join(cleaned)
-    except Exception:
+    if not parts:
         return ""
+
+    # Find 'claude' binary in the argv list.
+    claude_idx = next((i for i, p in enumerate(parts) if p.endswith("claude")), -1)
+    if claude_idx < 0:
+        return ""
+
+    tokens = parts[claude_idx + 1:]
+
+    # Walk tokens pairing --flags with their values.
+    # Consecutive non-flag tokens are joined as a single value (preserves paths
+    # with spaces when the argv source can provide them).
+    # Flags/values containing shell metacharacters are dropped to prevent injection.
+    _shell_metachars = set(';`$|()')
+    cleaned: list[str] = []
+    skip_count = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if skip_count > 0:
+            skip_count -= 1
+            i += 1
+            continue
+
+        # Skip resume/continue flags and their session ID argument
+        if tok in ("--resume", "--continue", "-c"):
+            skip_count = 1
+            i += 1
+            continue
+
+        # Skip bare UUID-like session ID args
+        if len(tok) >= 32 and "-" in tok and not tok.startswith("-"):
+            i += 1
+            continue
+
+        if tok.startswith("-"):
+            # Collect all following non-flag tokens as this flag's value
+            j = i + 1
+            while j < len(tokens) and not tokens[j].startswith("-"):
+                j += 1
+            value_tokens = tokens[i + 1:j]
+            value = " ".join(value_tokens) if value_tokens else ""
+
+            # Drop flag+value if value contains shell injection metacharacters
+            if any(c in _shell_metachars for c in value):
+                i = j
+                continue
+
+            if value:
+                cleaned.append(tok)
+                cleaned.append(shlex.quote(value))
+            else:
+                cleaned.append(tok)
+            i = j
+        else:
+            # Bare non-flag token (shouldn't be common after flag extraction)
+            if not any(c in _shell_metachars for c in tok):
+                cleaned.append(shlex.quote(tok))
+            i += 1
+
+    return " ".join(cleaned)
 
 
 def _detect_terminal_env() -> str:
@@ -821,6 +916,12 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
         print(f"  SSH session — skipping terminate+resume. Resume manually: {resume_cmd}")
         return
 
+    # Verify the PID still belongs to a Claude process before sending any signal.
+    # claude_pid is captured at daemon start; it may have been recycled.
+    if not _is_claude_process(claude_pid):
+        print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
+        return
+
     if term_env == "tmux":
         # tmux: graceful /exit via send-keys, then resume in same pane
         pane = os.environ.get("TMUX_PANE", "")
@@ -835,7 +936,8 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
 
         # Wait for Claude to exit
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            os.kill(claude_pid, signal.SIGTERM)
+            if _is_claude_process(claude_pid):
+                os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
         time.sleep(1)
@@ -859,7 +961,8 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
         )
 
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            os.kill(claude_pid, signal.SIGTERM)
+            if _is_claude_process(claude_pid):
+                os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
         time.sleep(1)
@@ -874,20 +977,24 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     # Plain terminal — SIGTERM + spawn resume watcher
     try:
         if system == "Windows":
-            subprocess.call(["taskkill", "/PID", str(claude_pid)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if _is_claude_process(claude_pid):
+                subprocess.call(["taskkill", "/PID", str(claude_pid)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            os.kill(claude_pid, signal.SIGTERM)
+            if _is_claude_process(claude_pid):
+                os.kill(claude_pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
     if not _wait_for_exit(claude_pid, timeout=5.0):
         try:
             if system == "Windows":
-                subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if _is_claude_process(claude_pid):
+                    subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                os.kill(claude_pid, signal.SIGKILL)
+                if _is_claude_process(claude_pid):
+                    os.kill(claude_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -909,6 +1016,10 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
 
     system = platform.system()
 
+    # log_dir is a bash-safe representation of project_dir for the echo log line.
+    # shell_quote wraps in single quotes (POSIX safe); metachars are not executable.
+    log_dir = shell_quote(project_dir)
+
     if system == "Darwin":
         resume_cmd = (
             f"osascript -e 'tell application \"Terminal\" to do script "
@@ -923,18 +1034,25 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
             f"else echo 'No terminal emulator found' >> /tmp/cozempic_guard.log; fi"
         )
     elif system == "Windows":
+        # Escape cmd.exe metacharacters in project_dir so they cannot execute.
+        # ^ is the cmd.exe escape character; prefix each metachar with ^ to
+        # prevent them from being interpreted as shell operators.
+        _cmd_metachars = set('&|<>^"')
+        escaped_dir = "".join(f"^{c}" if c in _cmd_metachars else c for c in project_dir)
         resume_cmd = (
-            f"start cmd /c \"cd /d {project_dir} && claude {resume_flag}\""
+            f"start cmd /c \"cd /d {escaped_dir} && claude {resume_flag}\""
         )
+        # Use escaped form in log line too so the watcher_script has no raw metachars
+        log_dir = escaped_dir
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")
         return
 
     watcher_script = (
-        f"while kill -0 {claude_pid} 2>/dev/null; do sleep 1; done; "
+        f"while kill -0 {int(claude_pid)} 2>/dev/null; do sleep 1; done; "
         f"sleep 1; "
         f"{resume_cmd}; "
-        f"echo \"$(date): Cozempic guard resumed Claude in {project_dir}\" >> /tmp/cozempic_guard.log"
+        f"echo \"$(date): Cozempic guard resumed Claude in {log_dir}\" >> /tmp/cozempic_guard.log"
     )
 
     subprocess.Popen(
@@ -966,9 +1084,10 @@ def _cleanup_legacy_pid(cwd: str) -> None:
         try:
             pid = int(legacy.read_text().strip())
             os.kill(pid, 0)
-            # Still alive — kill it so session-scoped guard can take over
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(1)
+            # Only SIGTERM if we can confirm this is actually our daemon.
+            if _is_cozempic_guard_process(pid):
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(1)
         except (ValueError, ProcessLookupError, PermissionError, OSError):
             pass
         legacy.unlink(missing_ok=True)
@@ -982,13 +1101,32 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
 
     Returns the PID if running, None otherwise.
     """
+    norm_sid = _normalize_session_id(session_id)
     pid_path = _pid_file_for_session(session_id)
     if not pid_path.exists():
         return None
 
     try:
         pid = int(pid_path.read_text().strip())
+        if pid <= 0:
+            # Guard against PID-reuse footgun: os.kill(0, sig) broadcasts to
+            # the caller's process group rather than targeting a sentinel.
+            # If a concurrent start_guard_daemon in THIS process holds the
+            # session spawn lock, the placeholder is live — skip the unlink.
+            with _spawn_locks_mu:
+                lock = _spawn_locks.get(norm_sid)
+            if lock is not None and not lock.acquire(blocking=False):
+                # Lock is held → spawner is in-flight; placeholder is live.
+                return None
+            if lock is not None:
+                lock.release()
+            pid_path.unlink(missing_ok=True)
+            return None
         os.kill(pid, 0)
+        # Verify the PID is actually our guard — defend against PID reuse.
+        if not _is_cozempic_guard_process(pid):
+            pid_path.unlink(missing_ok=True)
+            return None
         return pid
     except (ValueError, ProcessLookupError, PermissionError):
         pid_path.unlink(missing_ok=True)
@@ -1102,6 +1240,88 @@ def start_guard_daemon(
     if claude_pid is None:
         claude_pid = find_claude_pid()
 
+    # Acquire the per-session spawn lock before O_CREAT so that a concurrent
+    # _is_guard_running_for_session (same process) sees the lock is held and skips
+    # the unlink of our in-flight "0" placeholder. Released after the real PID
+    # is committed. File-level O_CREAT|O_EXCL still guards cross-process races.
+    norm_sid = _normalize_session_id(session_id) if session_id else ""
+    with _spawn_locks_mu:
+        if norm_sid not in _spawn_locks:
+            _spawn_locks[norm_sid] = threading.Lock()
+        spawn_lock = _spawn_locks[norm_sid]
+    spawn_lock.acquire()
+
+    # Atomically claim the pid slot before spawning (O_CREAT|O_EXCL prevents TOCTOU).
+    # Other OSErrors (ENOSPC, EROFS, EACCES) are non-fatal: return started=False
+    # with a reason so the non-interactive SessionStart hook doesn't crash silently.
+    _claim_result: dict | None = None
+    try:
+        try:
+            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, b"0")  # placeholder; real PID written after Popen
+            os.close(fd)
+        except (FileExistsError, OSError) as _e:
+            if not isinstance(_e, FileExistsError):
+                _claim_result = {"started": False, "reason": f"pidfile: {_e}"}
+            else:
+                # Peek at what the existing file holds to decide the retry strategy.
+                try:
+                    _raw = pid_path.read_text().strip() if pid_path.exists() else ""
+                    _on_disk_pid = int(_raw) if _raw else 0
+                except (ValueError, OSError):
+                    _on_disk_pid = 0
+                if _on_disk_pid > 0:
+                    # File holds a real PID (> 0): a concurrent winner just wrote it.
+                    # Trust the write — don't call _is_guard_running_for_session (it
+                    # would probe os.kill which may fail for a just-spawned process,
+                    # unlink the file, and break the invariant). Dead-guard detection
+                    # happens on the NEXT call to start_guard_daemon.
+                    _claim_result = {
+                        "started": False,
+                        "pid": _on_disk_pid,
+                        "pid_file": str(pid_path),
+                        "log_file": None,
+                        "already_running": True,
+                    }
+                else:
+                    # File holds a placeholder (pid <= 0): either a concurrent spawn's
+                    # in-flight "0" or a stale placeholder from a previous crash.
+                    # Re-read via the full helper which handles the spawn-lock check.
+                    existing_pid = _is_guard_running_for_session(session_id) if session_id else None
+                    if existing_pid:
+                        _claim_result = {
+                            "started": False,
+                            "pid": existing_pid,
+                            "pid_file": str(pid_path),
+                            "log_file": None,
+                            "already_running": True,
+                        }
+                    else:
+                        # Stale placeholder (previous crash before real PID was written) — remove and retry once
+                        pid_path.unlink(missing_ok=True)
+                        try:
+                            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                            os.write(fd, b"0")
+                            os.close(fd)
+                        except (FileExistsError, OSError) as _e2:
+                            if not isinstance(_e2, FileExistsError):
+                                _claim_result = {"started": False, "reason": f"pidfile: {_e2}"}
+                            else:
+                                existing_pid = _is_guard_running_for_session(session_id) if session_id else None
+                                _claim_result = {
+                                    "started": False,
+                                    "pid": existing_pid,
+                                    "pid_file": str(pid_path),
+                                    "log_file": None,
+                                    "already_running": True,
+                                }
+    except Exception:
+        spawn_lock.release()
+        raise
+    if _claim_result is not None:
+        spawn_lock.release()
+        return _claim_result
+
     # Build the guard command
     cmd_parts = [
         sys.executable, "-m", "cozempic.cli", "guard",
@@ -1146,8 +1366,13 @@ def start_guard_daemon(
             env=env,
         )
 
-    # Write PID file — keyed by session ID (or CWD hash as fallback)
-    pid_path.write_text(str(proc.pid))
+    # Write actual PID atomically via temp+rename so readers never see partial content
+    tmp_path = pid_path.with_suffix(".pid.tmp")
+    tmp_path.write_text(str(proc.pid))
+    tmp_path.replace(pid_path)
+    # Release the spawn lock now that the real PID is committed. Any concurrent
+    # _is_guard_running_for_session can now read the valid PID > 0.
+    spawn_lock.release()
 
     return {
         "started": True,
@@ -1177,14 +1402,21 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         if result.returncode != 0:
             return False
         args = (result.stdout or "").strip()
-        # Match our known spawn patterns:
-        #   python3 -m cozempic.cli guard ...
-        #   cozempic guard ...
-        #   /path/to/cozempic guard ...
-        if "cozempic.cli" in args and "guard" in args:
-            return True
         tokens = args.split()
-        if len(tokens) >= 2 and "cozempic" in tokens[0] and tokens[1] == "guard":
+        if not tokens:
+            return False
+        binary = Path(tokens[0]).name.lower()
+        # tokens[0] must be a python interpreter (any minor/patch version) or
+        # the cozempic entry-point. Rejects `run-cozempic`, `fake-cozempic`,
+        # `python-attacker`. Accepts `python3.11`, `python3.13.12`, etc. used
+        # by pyenv / Homebrew / distro packaging.
+        if not (binary == "cozempic" or re.fullmatch(r"^python(\d+(\.\d+)*)?$", binary)):
+            return False
+        # "cozempic.cli" and "guard" must appear as discrete arg tokens, not as
+        # substrings in filenames/paths (grep, less, vim on our source tree).
+        if "cozempic.cli" in tokens and "guard" in tokens:
+            return True
+        if len(tokens) >= 2 and binary == "cozempic" and tokens[1] == "guard":
             return True
         return False
     except (subprocess.SubprocessError, OSError):
@@ -1192,6 +1424,67 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         # unrelated process. The session stays with the existing daemon (or
         # no daemon), which is strictly safer than signaling the wrong one.
         return False
+
+
+def _is_claude_process(pid: int) -> bool:
+    """Verify that `pid` is a Claude Code process (node/claude binary).
+
+    Mirrors _is_cozempic_guard_process but for the Claude client side.
+    Guards against PID reuse: if Claude exits and its PID is recycled, a blind
+    SIGTERM on the recycled PID is a confused-deputy bug.
+
+    On Windows, `ps` is unavailable — uses `tasklist /FI "PID eq <pid>" /FO CSV`
+    instead. If tasklist also fails, falls back to liveness-only (returns True
+    for a live PID) so callers can still proceed with taskkill.
+    """
+    if platform.system() == "Windows":
+        return _is_claude_process_windows(pid)
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        args = (result.stdout or "").strip()
+        tokens = args.split()
+        if not tokens:
+            return False
+        binary = Path(tokens[0]).name.lower()
+        # Match native claude binary (whole name, not substring)
+        if binary == "claude":
+            return True
+        # Match node-based Claude Code: binary must be exactly "node" or "node.js"
+        # AND args must contain a Claude Code-specific marker.
+        if binary in ("node", "node.js"):
+            if "@anthropic-ai/claude-code" in args:
+                return True
+            # cli.js under a claude-code directory
+            if "claude-code/cli.js" in args or "claude-code\\cli.js" in args:
+                return True
+        return False
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _is_claude_process_windows(pid: int) -> bool:
+    """Windows-specific helper: probe via tasklist /FO CSV."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode != 0:
+            return True  # liveness fallback — let caller proceed with taskkill
+        output = (result.stdout or "").strip().lower()
+        if not output or "no tasks are running" in output:
+            return False
+        # CSV row: "image_name","pid","session_name","session#","mem_usage"
+        # Image name is the first quoted field.
+        image_name = output.split(",")[0].strip('"')
+        return any(marker in image_name for marker in ("claude", "node"))
+    except (subprocess.SubprocessError, OSError):
+        return True  # liveness fallback — let caller proceed with taskkill
 
 
 def _pid_file_points_to(session_id: str, expected_pid: int) -> bool:
