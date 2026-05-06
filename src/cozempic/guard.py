@@ -708,6 +708,25 @@ def guard_prune_cycle(
     return result
 
 
+def _is_cozempic_watcher_process(pid: int) -> bool:
+    """Verify that `pid` is a cozempic reload watcher (bash + cozempic watcher script).
+
+    Guards against false positives from pgrep substring matching.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        args = (result.stdout or "").strip()
+        # Real watcher script contains both "bash" and "Cozempic guard resumed Claude"
+        return "bash" in args and "Cozempic guard resumed Claude" in args
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def _cleanup_stale_watchers() -> None:
     """Kill stale reload watchers from previous Cozempic versions.
 
@@ -722,7 +741,9 @@ def _cleanup_stale_watchers() -> None:
         for pid_str in result.stdout.strip().split("\n"):
             if pid_str:
                 try:
-                    os.kill(int(pid_str), signal.SIGTERM)
+                    pid = int(pid_str)
+                    if _is_cozempic_watcher_process(pid):
+                        os.kill(pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, ValueError):
                     pass
     except Exception:
