@@ -1314,14 +1314,19 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         if result.returncode != 0:
             return False
         args = (result.stdout or "").strip()
-        # Match our known spawn patterns:
-        #   python3 -m cozempic.cli guard ...
-        #   cozempic guard ...
-        #   /path/to/cozempic guard ...
-        if "cozempic.cli" in args and "guard" in args:
-            return True
         tokens = args.split()
-        if len(tokens) >= 2 and "cozempic" in tokens[0] and tokens[1] == "guard":
+        if not tokens:
+            return False
+        binary = Path(tokens[0]).name.lower()
+        # tokens[0] must be a python interpreter or cozempic entry-point (not
+        # run-cozempic, fake-cozempic, etc.)
+        if binary not in ("python", "python3", "cozempic"):
+            return False
+        # "cozempic.cli" and "guard" must appear as discrete arg tokens, not as
+        # substrings in filenames/paths (grep, less, vim on our source tree).
+        if "cozempic.cli" in tokens and "guard" in tokens:
+            return True
+        if len(tokens) >= 2 and binary == "cozempic" and tokens[1] == "guard":
             return True
         return False
     except (subprocess.SubprocessError, OSError):
