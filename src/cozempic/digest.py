@@ -279,17 +279,30 @@ def _get_assistant_text(msg: dict) -> str:
     return " ".join(parts)
 
 
+_SCOPE_KEYWORDS: tuple[tuple[str, frozenset[str]], ...] = (
+    # Order matters on overlap: `testing` before `file-ops` so that
+    # "write tests" (both write-verb and tests-noun) resolves to testing —
+    # the noun is the subject of the correction, the verb is incidental.
+    ("testing", frozenset({"test", "tests", "pytest", "unittest", "mock", "mocks", "assert", "asserts"})),
+    ("git", frozenset({"git", "commit", "commits", "push", "pushed", "branch", "branches", "merge", "merges", "merged", "co-authored", "co-authored-by"})),
+    ("file-ops", frozenset({"file", "files", "edit", "edits", "write", "writes", "read", "reads", "path", "paths", "directory", "directories"})),
+    ("communication", frozenset({"message", "messages", "comment", "comments", "pr", "prs", "issue", "issues", "slack"})),
+)
+
+
 def _infer_scope(text: str) -> str:
-    """Infer the scope of a correction from its content."""
-    text_lower = text.lower()
-    if any(kw in text_lower for kw in ("git", "commit", "push", "branch", "merge", "co-authored")):
-        return "git"
-    if any(kw in text_lower for kw in ("file", "edit", "write", "read", "path", "directory")):
-        return "file-ops"
-    if any(kw in text_lower for kw in ("test", "pytest", "unittest", "mock", "assert")):
-        return "testing"
-    if any(kw in text_lower for kw in ("message", "comment", "pr ", "issue", "slack")):
-        return "communication"
+    """Infer the scope of a correction from its content.
+
+    Tokenizes with `[\\w-]+` so hyphenated compounds like `co-authored-by`
+    stay intact, then matches against keyword sets as whole tokens. This
+    prevents substring false-positives (`digital` → `git`, `testimony` →
+    `test`) that silently broke the dedup gate (which requires scope match
+    before text-overlap merge).
+    """
+    tokens = set(re.findall(r"[\w-]+", text.lower()))
+    for scope, keywords in _SCOPE_KEYWORDS:
+        if tokens & keywords:
+            return scope
     return "general"
 
 
