@@ -665,5 +665,365 @@ class TestG8_MainLoopWatchdogVerifiesClaudeIdentity(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Round 2 — RED tests for adversarial findings NF-1..NF-5
+# See ADVERSARIAL_REPORT.md (branch audit/guard-py-hardening @ f03164a).
+# ---------------------------------------------------------------------------
+
+
+def _patch_ps(argv: str):
+    """Return a subprocess.run side-effect that emulates `ps -p <pid> -o args=`
+    returning the given argv line (returncode=0). Anything else returns empty."""
+    def fake_run(cmd, *a, **kw):
+        m = MagicMock()
+        m.returncode = 0
+        cmd_list = list(cmd) if isinstance(cmd, (list, tuple)) else [cmd]
+        if cmd_list and cmd_list[0] == "ps":
+            m.stdout = argv
+        else:
+            m.stdout = ""
+        return m
+    return fake_run
+
+
+# ---------------------------------------------------------------------------
+# NF-1 CRITICAL — _is_claude_process must reject generic node/python processes
+# ---------------------------------------------------------------------------
+class TestNF1_IsClaudeProcessRejectsNonClaudeNodes(unittest.TestCase):
+    """Root-cause finding from adversarial round 1: `"node" in comm` matches
+    EVERY node process (nodemon, VSCode ext host, electron apps, npm scripts).
+    On a Claude-user's laptop this is 5-20 unrelated processes — PID-reuse
+    defence collapses to "kill the first node process you find".
+    """
+
+    NON_CLAUDE_ARGVS = [
+        "/usr/local/bin/node /home/user/server.js",
+        "node /home/user/scripts/daily.js",
+        "/usr/bin/node /app/server.js --port 3000",
+        "npm run dev",
+        "/Applications/Visual Studio Code.app/Contents/MacOS/Electron --type=extensionHost",
+        "/Applications/Slack.app/Contents/MacOS/Slack --type=renderer",
+        "python /home/user/bench.py --target claude-code",
+        "python3 -c 'print(\"@anthropic-ai/claude-code is installed\")'",
+    ]
+
+    def test_rejects_common_non_claude_processes(self):
+        """Each argv listed is a realistic non-Claude process found on a
+        dev laptop. _is_claude_process MUST return False for all of them."""
+        from cozempic.guard import _is_claude_process
+        false_positives = []
+        for argv in self.NON_CLAUDE_ARGVS:
+            with patch("cozempic.guard.subprocess.run",
+                       side_effect=_patch_ps(argv)):
+                got = _is_claude_process(12345)
+            if got is True:
+                false_positives.append(argv)
+        self.assertEqual(
+            false_positives, [],
+            f"_is_claude_process false-positive on {len(false_positives)} "
+            f"non-Claude argv(s): {false_positives}. "
+            f"Substring match on 'node' / 'claude-code' is too loose — "
+            f"tighten to require a real Claude Code signature.",
+        )
+
+    def test_accepts_real_anthropic_claude_code_cli(self):
+        """Positive: the canonical `node /path/to/@anthropic-ai/claude-code/cli.js`
+        invocation must still be recognized."""
+        from cozempic.guard import _is_claude_process
+        real_claude = (
+            "/usr/local/bin/node "
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        )
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(real_claude)):
+            self.assertTrue(
+                _is_claude_process(54321),
+                "Tightened helper must still accept the canonical Claude Code node invocation",
+            )
+
+    def test_accepts_plain_claude_binary(self):
+        """Positive: a native `claude` binary (no node wrapper) must pass."""
+        from cozempic.guard import _is_claude_process
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps("claude --resume abc-123")):
+            self.assertTrue(
+                _is_claude_process(54322),
+                "Tightened helper must accept the native `claude` binary invocation",
+            )
+
+
+# ---------------------------------------------------------------------------
+# NF-2 CRITICAL — main-loop watchdog (guard.py:414-418) not wired to identity
+# ---------------------------------------------------------------------------
+class TestNF2_MainWatchdogUsesIdentityCheck(unittest.TestCase):
+    """Adversarial round 1 found: the `_is_claude_process` helper was added
+    (BUG-G8 fix) but NEVER wired into the main watchdog loop at guard.py:414.
+    The loop still only calls `os.kill(claude_pid, 0)` — PID-reuse bug unfixed.
+    """
+
+    def test_watchdog_source_invokes_identity_check(self):
+        """Static source contract: start_guard's watchdog section MUST call
+        `_is_claude_process(claude_pid)` — otherwise PID-reuse races through
+        liveness-only `os.kill(pid, 0)`."""
+        import inspect
+        from cozempic.guard import start_guard
+        src = inspect.getsource(start_guard)
+        has_identity_call = "_is_claude_process(claude_pid)" in src
+        self.assertTrue(
+            has_identity_call,
+            "Main-loop watchdog (guard.py:~414) does not call "
+            "_is_claude_process(claude_pid). BUG-G8 fix added the helper but "
+            "did not wire it into the watchdog — recycled-PID still races "
+            "through `os.kill(pid, 0)` alone.",
+        )
+
+    def test_watchdog_flips_claude_alive_on_identity_fail(self):
+        """When the identity check is wired, it MUST sit close enough to the
+        `claude_alive = False` flip to drive it. Proxy: both tokens appear
+        within a 400-char window of each other in the watchdog section."""
+        import inspect
+        from cozempic.guard import start_guard
+        src = inspect.getsource(start_guard)
+        if "_is_claude_process(claude_pid)" not in src:
+            self.fail(
+                "Watchdog has no identity call at all (see sibling test). "
+                "NF-2: main watchdog still uses liveness-only os.kill(pid, 0)."
+            )
+        idx = src.index("_is_claude_process(claude_pid)")
+        window = src[max(0, idx - 100):idx + 400]
+        self.assertIn(
+            "claude_alive", window,
+            "Identity helper found but does not flip claude_alive=False — "
+            "watchdog does not react to recycled PID.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# NF-3 HIGH — _is_cozempic_guard_process substring match is too loose
+# ---------------------------------------------------------------------------
+class TestNF3_IsCozempicGuardProcessRejectsLooseSubstrings(unittest.TestCase):
+    """`"cozempic.cli" in args` AND `"cozempic" in tokens[0]` both false-positive
+    on grep/less/vim sessions + any `*-cozempic-*` binary.
+    """
+
+    NON_GUARD_ARGVS = [
+        "grep -r cozempic.cli guard /home/user/projects",
+        "less /tmp/cozempic.cli-guard-output.log",
+        "/usr/local/bin/run-cozempic guard",
+        "/usr/local/bin/fake-cozempic guard --evil",
+        "vim /home/user/projects/cozempic/cli.py",
+    ]
+
+    def test_rejects_loose_substring_matches(self):
+        from cozempic.guard import _is_cozempic_guard_process
+        false_positives = []
+        for argv in self.NON_GUARD_ARGVS:
+            with patch("cozempic.guard.subprocess.run",
+                       side_effect=_patch_ps(argv)):
+                got = _is_cozempic_guard_process(12345)
+            if got is True:
+                false_positives.append(argv)
+        self.assertEqual(
+            false_positives, [],
+            f"_is_cozempic_guard_process false-positive on "
+            f"{len(false_positives)} non-guard argv(s): {false_positives}. "
+            f"Tighten token[0] to endswith python/cozempic AND require "
+            f"cozempic.cli + guard as discrete tokens.",
+        )
+
+    def test_accepts_real_daemon_invocation(self):
+        """Positive: canonical python -m cozempic.cli guard invocation."""
+        from cozempic.guard import _is_cozempic_guard_process
+        real = (
+            "/usr/local/bin/python3 -m cozempic.cli guard "
+            "--session abc-123 --threshold 50.0"
+        )
+        with patch("cozempic.guard.subprocess.run",
+                   side_effect=_patch_ps(real)):
+            self.assertTrue(
+                _is_cozempic_guard_process(55555),
+                "Tightened helper must still accept the canonical daemon invocation",
+            )
+
+
+# ---------------------------------------------------------------------------
+# NF-4 MED — atomic-claim block only catches FileExistsError
+# ---------------------------------------------------------------------------
+class TestNF4_AtomicClaimHandlesNonExistsOsError(unittest.TestCase):
+    """`os.open(pid_path, O_CREAT|O_EXCL|O_WRONLY)` can raise OSError with
+    errno ENOSPC / EROFS / EACCES / EMFILE. Currently only FileExistsError is
+    caught — other OSErrors propagate and kill the SessionStart hook silently.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.session_id = "44444444-aaaa-bbbb-cccc-000000000044"
+        from cozempic.guard import _pid_file_for_session
+        self.pid_path = _pid_file_for_session(self.session_id)
+        self.pid_path.unlink(missing_ok=True)
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+        key = self.session_id[:12]
+        self.log_path = Path("/tmp") / f"cozempic_guard_{key}.log"
+        self.log_path.unlink(missing_ok=True)
+        self.addCleanup(self.log_path.unlink, missing_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run_with_os_open_raising(self, errno_code: int):
+        """Invoke start_guard_daemon with a mocked os.open that raises OSError
+        with the given errno on the pidfile path. Returns result dict OR
+        `{'_raised': exc}` if uncaught."""
+        from cozempic.guard import start_guard_daemon
+
+        real_os_open = os.open
+
+        def fake_open(path, flags, *args, **kwargs):
+            if str(path) == str(self.pid_path) and (flags & os.O_EXCL):
+                raise OSError(errno_code, os.strerror(errno_code))
+            return real_os_open(path, flags, *args, **kwargs)
+
+        with (
+            patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard.find_claude_pid", return_value=7777),
+            patch("cozempic.guard.subprocess.Popen") as mock_popen,
+            patch("cozempic.guard.os.open", side_effect=fake_open),
+        ):
+            mock_popen.return_value = MagicMock(pid=9999)
+            try:
+                return start_guard_daemon(
+                    cwd=self.tmpdir,
+                    session_id=self.session_id,
+                    threshold_tokens=1000,
+                )
+            except OSError as e:
+                return {"_raised": e}
+
+    def test_enospc_does_not_crash_hook(self):
+        """ENOSPC must NOT propagate — return {started: False, reason: ...}."""
+        import errno as _errno_mod
+        result = self._run_with_os_open_raising(_errno_mod.ENOSPC)
+        self.assertNotIn(
+            "_raised", result,
+            f"ENOSPC propagated uncaught: {result.get('_raised')!r}. "
+            f"start_guard_daemon must return started=False with a reason, "
+            f"not crash the non-interactive SessionStart hook.",
+        )
+        self.assertFalse(
+            result.get("started"),
+            f"Expected started=False on ENOSPC; got {result!r}",
+        )
+        self.assertIn(
+            "reason", result,
+            "Result must carry a reason string explaining the failure",
+        )
+
+    def test_erofs_does_not_crash_hook(self):
+        """EROFS (/tmp read-only) must NOT propagate."""
+        import errno as _errno_mod
+        result = self._run_with_os_open_raising(_errno_mod.EROFS)
+        self.assertNotIn(
+            "_raised", result,
+            f"EROFS propagated uncaught: {result.get('_raised')!r}",
+        )
+        self.assertFalse(result.get("started"))
+        self.assertIn("reason", result)
+
+    def test_eacces_does_not_crash_hook(self):
+        """EACCES (permission denied) must NOT propagate."""
+        import errno as _errno_mod
+        result = self._run_with_os_open_raising(_errno_mod.EACCES)
+        self.assertNotIn(
+            "_raised", result,
+            f"EACCES propagated uncaught: {result.get('_raised')!r}",
+        )
+        self.assertFalse(result.get("started"))
+        self.assertIn("reason", result)
+
+
+# ---------------------------------------------------------------------------
+# NF-5 MED — Windows taskkill bypasses _is_claude_process re-verify
+# ---------------------------------------------------------------------------
+class TestNF5_WindowsTaskkillReVerifies(unittest.TestCase):
+    """On Windows, `_terminate_and_resume` calls `taskkill /PID` and
+    `taskkill /F /PID` with NO identity re-check between the outer verify
+    and the kill call. On POSIX, the SIGKILL at line 975 IS guarded by
+    _is_claude_process; Windows is not.
+    """
+
+    def test_windows_taskkill_f_skipped_when_identity_fails_mid_race(self):
+        """Outer check passes (Claude alive), wait_for_exit times out, THEN
+        identity flips to False (PID recycled). taskkill /F MUST NOT run."""
+        from cozempic.guard import _terminate_and_resume
+
+        # Call sequence: 1st True (outer verify), subsequent False (post-wait)
+        call_sequence = [True, False, False, False, False]
+
+        def fake_is_claude_process(pid):
+            return call_sequence.pop(0) if call_sequence else False
+
+        subprocess_calls = []
+
+        def fake_subprocess_call(cmd, *a, **kw):
+            subprocess_calls.append(list(cmd))
+            return 0
+
+        with (
+            patch("cozempic.guard._detect_terminal_env", return_value="plain"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.platform.system", return_value="Windows"),
+            patch("cozempic.guard._is_claude_process",
+                  side_effect=fake_is_claude_process),
+            patch("cozempic.guard._wait_for_exit", return_value=False),
+            patch("cozempic.guard.subprocess.call",
+                  side_effect=fake_subprocess_call),
+            patch("cozempic.guard._spawn_reload_watcher"),
+            patch("cozempic.guard.os.kill"),
+        ):
+            _terminate_and_resume(31337, r"C:\proj", session_id="sess-w")
+
+        forced_taskkill = [
+            c for c in subprocess_calls
+            if c and c[0] == "taskkill" and "/F" in c and str(31337) in c
+        ]
+        self.assertEqual(
+            forced_taskkill, [],
+            f"Windows taskkill /F invoked despite identity returning False "
+            f"pre-kill: {forced_taskkill}. Recycled-PID blast radius: "
+            f"force-kills whatever process now owns PID 31337 (Chrome tab, "
+            f"Discord, etc.).",
+        )
+
+    def test_windows_taskkill_proceeds_when_identity_still_valid(self):
+        """Positive: when _is_claude_process stays True, some taskkill MUST
+        run — guards against a fix that over-protects and leaves Claude alive."""
+        from cozempic.guard import _terminate_and_resume
+
+        with (
+            patch("cozempic.guard._detect_terminal_env", return_value="plain"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.platform.system", return_value="Windows"),
+            patch("cozempic.guard._is_claude_process", return_value=True),
+            patch("cozempic.guard._wait_for_exit", return_value=False),
+            patch("cozempic.guard.subprocess.call") as mock_call,
+            patch("cozempic.guard._spawn_reload_watcher"),
+            patch("cozempic.guard.os.kill"),
+        ):
+            _terminate_and_resume(44444, r"C:\proj", session_id="sess-w2")
+
+            taskkill_for_pid = [
+                c for c in mock_call.call_args_list
+                if c.args and len(c.args[0]) >= 1
+                and c.args[0][0] == "taskkill"
+                and str(44444) in c.args[0]
+            ]
+            self.assertGreaterEqual(
+                len(taskkill_for_pid), 1,
+                "No taskkill invoked when identity check stayed True — "
+                "fix over-protects and leaves Claude running",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
