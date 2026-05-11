@@ -777,8 +777,12 @@ def update_digest(
         else:
             rejected += 1
 
-    if added > 0 or upvoted > 0:
-        save_digest_store(store)
+    # Persist unconditionally — BUG-9. `store.session_id` is mutated above
+    # regardless of the admission outcome, and `updated` timestamp must
+    # advance even on rejected-only or zero-candidate runs so downstream
+    # consumers can distinguish stale from fresh state. `save_digest_store`
+    # is atomic (tmp+fsync+rename) and concurrent-merge-safe.
+    save_digest_store(store)
 
     return added, upvoted, rejected
 
