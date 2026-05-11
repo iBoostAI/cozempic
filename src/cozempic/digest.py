@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,17 @@ ADMISSION_THRESHOLD = 0.55  # A-MAC composite score gate
 PRUNE_THRESHOLD = 0.30  # Below this → prune
 PROMOTION_COUNT = 2  # Occurrences needed to promote pending → active (was 3, too high for real usage)
 DECAY_DAYS = 30  # Universal decay period (MemoryArena 2602.16313)
+
+# Opt-in stderr diagnostics for silent _to_prohibition rejections (A2).
+# Resolved at import time; tests monkeypatch `cozempic.digest._DEBUG` directly.
+# Runs inside hooks (PreCompact, Stop) where unconditional stderr would leak
+# to users — hence env-gated.
+_DEBUG = os.environ.get("COZEMPIC_DEBUG") == "1"
+
+
+def _debug(msg: str) -> None:
+    if _DEBUG:
+        print(f"[cozempic.digest] {msg}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -327,9 +339,22 @@ def _to_prohibition(text: str) -> str:
     """
     text = text.strip()
     # Reject structural / oversize input — cannot be a clean correction.
-    if not text or len(text) > 200 or text.count("\n") > 2:
+    if not text:
+        return ""
+    if len(text) > 200:
+        _debug(f"_to_prohibition rejected: len={len(text)} > 200 — {text[:60]!r}")
+        return ""
+    if text.count("\n") > 2:
+        _debug(
+            f"_to_prohibition rejected: multi-paragraph "
+            f"({text.count(chr(10))} newlines) — {text[:60]!r}"
+        )
         return ""
     if text[0] in "<-*#`":
+        _debug(
+            f"_to_prohibition rejected: structural-prefix {text[0]!r} — "
+            f"{text[:60]!r}"
+        )
         return ""
     # Already in prohibition form
     if text.lower().startswith("do not ") or text.lower().startswith("don't "):
