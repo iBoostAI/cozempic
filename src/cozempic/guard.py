@@ -1076,13 +1076,18 @@ def _pid_file_for_session(session_id: str) -> Path:
     Validates `session_id` against a UUID-shaped regex (hex chars + dashes,
     length >= 12) so that path-traversal sequences or stray filename tokens
     cannot escape `/tmp/cozempic_guard_*.pid` namespace — see BUG-G13.
-    Raises ValueError on malformed input so callers fail fast.
+    Normalizes to lowercase BEFORE truncation so different-case variants of
+    the same UUID map to the same pidfile (R1-F2 — prevents split-brain).
+    Raises ValueError on malformed input so callers fail fast; library-API
+    callers like `_is_guard_running_for_session` catch and return None
+    (treat invalid session as "no daemon"). Error message logs only type
+    and length — never raw content — to avoid PII leaks (R1-F8).
     """
-    session_id = _normalize_session_id(session_id)
+    session_id = _normalize_session_id(session_id).lower()
     if not _SESSION_ID_RE.fullmatch(session_id):
         raise ValueError(
             f"session_id must be a hex/UUID identifier (>=12 chars), "
-            f"got {session_id!r}"
+            f"got {type(session_id).__name__} of length {len(session_id)}"
         )
     return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
 
@@ -1117,9 +1122,17 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     """Check if a guard daemon is already running for this specific session.
 
     Returns the PID if running, None otherwise.
+
+    An invalid `session_id` (non-UUID) is treated as "no daemon" (None)
+    rather than raising — R1-F1 library-API safety. Callers outside CLI
+    (hooks, pytest, third-party integrations) should get a safe default.
     """
     norm_sid = _normalize_session_id(session_id)
-    pid_path = _pid_file_for_session(session_id)
+    try:
+        pid_path = _pid_file_for_session(session_id)
+    except ValueError:
+        # Invalid session_id shape — no daemon can exist for it.
+        return None
     if not pid_path.exists():
         return None
 

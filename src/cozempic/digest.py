@@ -345,22 +345,22 @@ def _to_prohibition(text: str) -> str:
     """
     text = text.strip()
     # Reject structural / oversize input — cannot be a clean correction.
+    # R1-F5: debug messages emit metadata only (length, newline count, single
+    # prefix char). Never echo raw user text — risk of PII / credentials
+    # leaking into stderr logs when COZEMPIC_DEBUG=1.
     if not text:
         return ""
     if len(text) > 200:
-        _debug(f"_to_prohibition rejected: len={len(text)} > 200 — {text[:60]!r}")
+        _debug(f"_to_prohibition rejected: len={len(text)} > 200 (content redacted)")
         return ""
     if text.count("\n") > 2:
         _debug(
             f"_to_prohibition rejected: multi-paragraph "
-            f"({text.count(chr(10))} newlines) — {text[:60]!r}"
+            f"({text.count(chr(10))} newlines, content redacted)"
         )
         return ""
     if text[0] in "<-*#`":
-        _debug(
-            f"_to_prohibition rejected: structural-prefix {text[0]!r} — "
-            f"{text[:60]!r}"
-        )
+        _debug(f"_to_prohibition rejected: structural-prefix {text[0]!r}")
         return ""
     # Already in prohibition form
     if text.lower().startswith("do not ") or text.lower().startswith("don't "):
@@ -387,15 +387,15 @@ def _to_prohibition(text: str) -> str:
     # Default: prefix with "Do not". Require a letter lead so the grammar is
     # valid — digit/punctuation prefixes produce malformed prohibitions like
     # "Do not 5xx errors..." which no model can usefully follow (BUG-12).
+    # R1-F4: isalpha() gate applies regardless of length, so short digit-led
+    # text ("5xx", "1st") is also rejected rather than returning raw.
     # Existing digit-prefixed active rules auto-demote via the load_digest_store
     # migration path which re-runs _to_prohibition on rule.evidence.
-    if len(text) > 5 and text[0].isalpha():
-        return f"Do not {text[0].lower()}{text[1:]}"
-    if len(text) > 5:
-        # Malformed lead (digit / punctuation / symbol) — reject. Returning
-        # the raw input was itself a latent bug: callers expect prohibition
-        # framing and would otherwise persist a non-prohibition rule.
+    if not text[0].isalpha():
+        _debug(f"_to_prohibition rejected: non-letter lead {text[0]!r}")
         return ""
+    if len(text) > 5:
+        return f"Do not {text[0].lower()}{text[1:]}"
     return text
 
 
@@ -822,7 +822,13 @@ def update_digest(
     # advance even on rejected-only or zero-candidate runs so downstream
     # consumers can distinguish stale from fresh state. `save_digest_store`
     # is atomic (tmp+fsync+rename) and concurrent-merge-safe.
-    save_digest_store(store)
+    # R1-F6: readonly digest dir (Docker --read-only, hardened systemd,
+    # NFS quota hit) must not crash the hook. Degrade to in-memory only;
+    # disk catches up on the next call when the FS recovers.
+    try:
+        save_digest_store(store)
+    except (OSError, PermissionError) as e:
+        _debug(f"save_digest_store failed (non-fatal): {type(e).__name__}")
 
     return added, upvoted, rejected
 
