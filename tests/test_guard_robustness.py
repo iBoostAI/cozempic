@@ -25,7 +25,7 @@ class TestReloadSelfDaemon(unittest.TestCase):
         from cozempic.guard import reload_self_daemon
         result = reload_self_daemon(
             cwd="/tmp",
-            session_id="absolutely-nonexistent-session-uuid-for-test",
+            session_id="11111111-2222-3333-4444-555555555555",
         )
         self.assertFalse(result["reloaded"])
         self.assertIn("no daemon", result["reason"].lower())

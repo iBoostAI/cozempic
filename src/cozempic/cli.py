@@ -1582,7 +1582,13 @@ def main():
         "remind": cmd_remind,
     }
 
-    commands[args.command](args)
+    try:
+        commands[args.command](args)
+    except ValueError as e:
+        # Surface malformed user inputs (e.g., invalid --session UUID per
+        # BUG-G13) as a clean one-line error instead of a Python traceback.
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

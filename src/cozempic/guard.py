@@ -1064,9 +1064,26 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
     )
 
 
+# UUID-shape / hex-only guard for session_id inputs to pidfile path composition
+# (BUG-G13). 12+ chars keeps the `[:12]` truncation meaningful; the hex+dash
+# character class rejects path-traversal sequences and any non-UUID identifier.
+_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{12,}$")
+
+
 def _pid_file_for_session(session_id: str) -> Path:
-    """Return the PID file path for a guard daemon watching a specific session."""
+    """Return the PID file path for a guard daemon watching a specific session.
+
+    Validates `session_id` against a UUID-shaped regex (hex chars + dashes,
+    length >= 12) so that path-traversal sequences or stray filename tokens
+    cannot escape `/tmp/cozempic_guard_*.pid` namespace — see BUG-G13.
+    Raises ValueError on malformed input so callers fail fast.
+    """
     session_id = _normalize_session_id(session_id)
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(
+            f"session_id must be a hex/UUID identifier (>=12 chars), "
+            f"got {session_id!r}"
+        )
     return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
 
 
