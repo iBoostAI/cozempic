@@ -1,459 +1,461 @@
-# polish-v2 Audit Report — PR-A
+# guard.py Audit Report — v1.8.7
 
-**Scope**: 7 parked bugs against v1.8.9 (commit f67aa72). Branch `feat/polish-v2`.
-**Targets**: `src/cozempic/digest.py` (983 LOC) and `src/cozempic/guard.py` (1656 LOC).
-**Methodology**: full symbol re-read at each hint line, cross-reference of callers, lexical/semantic repro of each failure mode in a throwaway REPL, and whole-worktree grep for dead-code / caller-count claims.
-**NOTE**: This file previously held the v1.8.7 guard audit (de38d56). It is overwritten here to avoid two stale reports coexisting in the same worktree — the prior audit's findings all landed in v1.8.8/1.8.9 and need no further action.
+Scope: `src/cozempic/guard.py` @ branch `audit/guard-py-hardening` (worktree `e-guard-audit`), 1346 LOC.
+Methodology: full read + cross-file trace of helpers (`session.py`, `helpers.py`) + git log review to skip already-fixed regressions + existing `tests/test_guard_robustness.py` coverage check.
 
 ---
 
-## Verdict summary
+## Confirmed bugs
 
-| Bug | File:line | Verdict | Severity | Risk flag |
-|---|---|---|---|---|
-| BUG-9 | digest.py:755,772-773 | REAL | LOW | — |
-| A12 | digest.py:175 | REAL | MED | — |
-| A2 | digest.py:322 | REAL | LOW | — |
-| BUG-13 | digest.py:95-101 | REAL | MED | ID sequence change — verify no test pins 4-digit format |
-| BUG-12 | digest.py:349-350 | REAL | MED | BREAKING for users with digit-prefixed rule text |
-| BUG-G13 | guard.py:1067-1070 | REAL | HIGH | Path-traversal possible with adversarial session_id |
-| BUG-G16 | guard.py:1141-1143 | REAL | LOW | Zero callers in src/ AND tests/ — safe to delete |
+Severity scale: CRITICAL (data loss / kill-wrong-process / security), HIGH (operational regression, silent unprotected session), MED (resource leak, resilience gap), LOW (edge-case hygiene).
 
-All 7 bugs are REAL and in scope. One carries a scope-change risk (BUG-12), two carry minor invariants to preserve (BUG-13 ID format, BUG-G13 normal-path backward compat). Details below.
+Existing robustness test (`tests/test_guard_robustness.py`) covers: SIGTERM constant, backup-cleanup importability, `reload_self_daemon` short-circuit when no daemon, `start_guard_daemon` passes `--claude-pid`. NONE of the bugs below are covered.
 
 ---
 
-## BUG-9 — `update_digest` does not persist session_id / migration on rejected-only runs
+### BUG-G1 — `_cleanup_legacy_pid` SIGTERMs an unverified PID (confused deputy)
 
-**Location**: `src/cozempic/digest.py:755` (mutation) and `:772-773` (persist gate).
-**Verdict**: REAL
+**Severity**: CRITICAL
+**Location**: `guard.py:962-977`
 
-### Current code
-```python
-def update_digest(
-    messages: list[Message],
-    since_turn: int = 0,
-    project_dir: str = "",
-    session_id: str = "",
-) -> tuple[int, int, int]:
-    """Extract corrections from messages and update the digest store.
-
-    Returns (new_rules, upvoted, rejected).
-    """
-    store = load_digest_store(project_dir)
-    store.session_id = session_id                       # ← line 755: mutation
-
-    candidates = extract_corrections(messages, since_turn=since_turn)
-
-    added = 0
-    upvoted = 0
-    rejected = 0
-
-    for rule in candidates:
-        result = admit_rule(rule, store)
-        if result == "added":
-            added += 1
-        elif result == "upvoted":
-            upvoted += 1
-        else:
-            rejected += 1
-
-    if added > 0 or upvoted > 0:                        # ← line 772: persist gate
-        save_digest_store(store)                        # ← line 773
-    return added, upvoted, rejected
 ```
-
-### Why it's a bug
-`store.session_id = session_id` at line 755 mutates the in-memory store BEFORE the admission loop, so the session_id always changes whenever `update_digest` is called. The `if added > 0 or upvoted > 0` gate at line 772 only persists when NEW material lands — but `store.session_id` is already mutated, and silently lost if every candidate is rejected. The `updated` timestamp (set inside `save_digest_store` line 682) is also never bumped on rejected-only runs, so downstream consumers cannot distinguish "stale file from a prior run" from "hook ran today and found nothing to admit".
-
-Symptoms users can hit:
-1. `cozempic` hook fires on a quiet session → all rule candidates low-score → `rejected_only=N`, but the `behavioral-digest.json` file still shows last week's `session_id`, misleading anyone inspecting the store via `cozempic doctor` / show.
-2. Any `load_digest_store → save_digest_store` migration in between (line 649-653 handles this correctly within `load_digest_store`), so BUG-9 is specifically the `update_digest` path where the caller's session_id is dropped.
-
-### Proposed fix (spec)
-Persist unconditionally when any store field changed — simplest and safest: always save when candidates were processed (even if all rejected), since session_id was already mutated.
-
-```python
-if added > 0 or upvoted > 0 or store.session_id != prior_session_id:
-    save_digest_store(store)
-```
-
-Or simpler/idempotent:
-
-```python
-# Persist unconditionally — save is atomic and cheap relative to JSONL scan.
-# Rejected-only runs still need to bump `updated` and retain the new session_id.
-save_digest_store(store)
-```
-
-The simpler form is preferred — `save_digest_store` already runs concurrent-merge at line 671-680 and is write-idempotent.
-
-### Test contracts (minimum 2)
-1. `test_rejected_only_persists_session_id` — Pre-seed a `behavioral-digest.json` with `session_id="old"`. Call `update_digest(messages=[...all-noise-rejected...], session_id="new")`. Load store from disk. Assert `store.session_id == "new"`.
-2. `test_rejected_only_bumps_updated_timestamp` — Pre-seed a file with `updated="2020-01-01T00:00:00+00:00"`. Call `update_digest` with rejected-only candidates. Reload store. Assert `store.updated > "2020-01-01"`.
-3. `test_zero_candidates_no_op` (regression) — Call `update_digest(messages=[])` with empty input. No exceptions, the file is either unchanged or re-written idempotently with the same content.
-
----
-
-## A12 — slash-command noise filter is case-sensitive (`/Compact` leaks)
-
-**Location**: `src/cozempic/digest.py:174-176`.
-**Verdict**: REAL
-
-### Current code
-```python
-# Slash command: '/' + lowercase letter (distinguish from file paths like /Users)
-if len(stripped) >= 2 and stripped[0] == "/" and stripped[1].islower():
-    return True
-```
-
-### Why it's a bug
-The filter intends to catch Claude Code slash-command turns like `/compact`, `/clear`, `/init`. The `.islower()` check rejects `/Compact`, `/INIT`, `/Help`, etc. Verified experimentally: `"C".islower()` is False, so `/Compact` passes through as a non-noise user turn and becomes a correction candidate.
-
-Users invoking slash commands capitalised (either deliberately or via auto-capitalise on iPadOS / autocorrect on macOS keyboards) leak "Do not compact" style rules into the digest. Observed by comparing `/compact` flow vs `/Compact` flow on any live session.
-
-The same issue applies to ALL CAPS (`/COMPACT`) which `.islower()` also rejects.
-
-### Proposed fix (spec)
-Use `.isalpha()` instead of `.islower()` — any alphabetical char distinguishes a command from `/Users/...` file paths (file paths start with `/U` uppercase which WOULD match `.isalpha()` — must combine with a path-disambiguator).
-
-Correct fix: match any alpha char for slot [1], AND verify the line is not a filesystem path (absolute paths typically have `/` as separator after the name).
-
-```python
-# Slash command: '/' + letter, not a file path. Case-insensitive because users
-# sometimes type /Compact or /INIT (A12). File paths (/Users, /tmp, /opt) are
-# disambiguated by containing another '/' — slash commands are single-token.
-if (
-    len(stripped) >= 2
-    and stripped[0] == "/"
-    and stripped[1].isalpha()
-    and "/" not in stripped[1:].split()[0]  # no second slash in first token
-):
-    return True
-```
-
-Simpler alternative (matches current intent more directly): pre-compile a regex `^/[A-Za-z][A-Za-z0-9_-]*(\s|$)` and match.
-
-```python
-_SLASH_CMD_RE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*(?:\s|$)")
+962  def _cleanup_legacy_pid(cwd: str) -> None:
 ...
-if _SLASH_CMD_RE.match(stripped):
-    return True
+967          pid = int(legacy.read_text().strip())
+968          os.kill(pid, 0)
+969          # Still alive — kill it so session-scoped guard can take over
+970          os.kill(pid, signal.SIGTERM)
 ```
 
-The regex form avoids the `/Users/...` false-positive cleanly: `/Users/` does not match because after `Users` the next char is `/` which is neither whitespace nor end-of-string.
+**Issue**: The function reads a PID from a pre-1.6.13 legacy pid file keyed by CWD hash, confirms the process is alive with `os.kill(pid, 0)`, then SIGTERMs it — with **zero verification that the PID is actually a cozempic guard daemon**. The codebase already has `_is_cozempic_guard_process` (line 1161) introduced specifically to defend against this kind of confused-deputy bug, and `reload_self_daemon` at lines 1249/1268 uses it correctly. `_cleanup_legacy_pid` does not.
 
-### Test contracts (minimum 2)
-1. `test_compact_uppercase_is_noise` — `_is_system_noise("/Compact")` must return True (currently False).
-2. `test_init_allcaps_is_noise` — `_is_system_noise("/INIT")` must return True.
-3. `test_file_path_users_is_not_noise` — `_is_system_noise("/Users/alice/foo.py needs a fix")` must return False (regression — file-path protection preserved).
-4. `test_compact_lowercase_still_noise` — `_is_system_noise("/compact")` remains True (regression).
+**Repro**:
+1. Install cozempic pre-1.6.13 (creates `/tmp/cozempic_guard_<md5(cwd)>.pid`).
+2. Crash / uninstall without cleanup.
+3. OS recycles the dead PID to an unrelated user process (e.g., a Node server, a long-running editor).
+4. User installs cozempic ≥1.6.13 and opens any session with the same CWD → `start_guard_daemon` → `_cleanup_legacy_pid` → SIGTERM sent to the recycled-PID process.
+
+**Fix direction**: Before line 970, gate with `if _is_cozempic_guard_process(pid)`. Otherwise just unlink the legacy file.
+
+**Not covered by existing tests**.
 
 ---
 
-## A2 — `_to_prohibition` silently rejects long/multi-paragraph input (no debug signal)
+### BUG-G2 — `_cleanup_stale_watchers` SIGTERMs on substring-only pgrep match
 
-**Location**: `src/cozempic/digest.py:319-325`.
-**Verdict**: REAL (missing debug path — not a wrong-behavior bug)
+**Severity**: CRITICAL
+**Location**: `guard.py:711-729`
 
-### Current code
-```python
-    text = text.strip()
-    # Reject structural / oversize input — cannot be a clean correction.
-    if not text or len(text) > 200 or text.count("\n") > 2:
-        return ""
-    if text[0] in "<-*#`":
-        return ""
+```
+717      result = subprocess.run(
+718          ["pgrep", "-f", "cozempic.*resumed Claude"],
+719          ...
+720      )
+721      for pid_str in result.stdout.strip().split("\n"):
+722          if pid_str:
+723              try:
+724                  os.kill(int(pid_str), signal.SIGTERM)
 ```
 
-### Why it's a bug
-`_to_prohibition` returning `""` is a sentinel for "skip this candidate" — caller in `extract_corrections` drops the rule silently. When users report "my correction was not captured", there is currently no way to diagnose which gate rejected it: noise filter, admission threshold, or `_to_prohibition` length/structure gate. `digest.py` contains zero `print`/`logging`/`stderr` calls (grep confirmed).
+**Issue**: `pgrep -f` matches the **entire command line** of any process. The pattern `cozempic.*resumed Claude` is a regex — any process whose argv contains those tokens in any order along with any characters between them matches. Concrete false positives:
 
-Impact: low (cosmetic / diagnosability), but A2 is explicitly in scope for polish-v2.
+- `vim ~/notes/cozempic_guard_resumed_Claude_debug.md` (argv contains `cozempic` + `resumed Claude`).
+- A user script named `cozempic_upgrade_resumed_claude_log.sh`.
+- Another Python process that loaded the watcher string into memory and passes through `ps` (unlikely but possible if argv contains a log message).
 
-### Proposed fix (spec)
-Emit an opt-in stderr debug line when `COZEMPIC_DEBUG=1` is set. Do NOT print unconditionally — digest runs inside hooks (PreCompact, Stop) where stderr noise would leak to the user. Keep the mechanism minimal: one module-level helper, no `logging` setup (cozempic keeps `dependencies = []`).
+Even without false positives, the function still doesn't call `_is_cozempic_guard_process` — any matching PID is unconditionally SIGTERM'd.
 
-```python
-import os
-import sys
+**Repro**: `sleep 999 & pgrep -f "cozempic.*resumed Claude"` — run a dummy process whose argv contains both tokens, start guard, watch it get killed.
 
-_DEBUG = os.environ.get("COZEMPIC_DEBUG") == "1"
+**Fix direction**: Either (a) make the pattern the actual watcher script shape used at lines 933-938 (`echo "$(date): Cozempic guard resumed Claude in ..."`) AND verify each match's full argv matches that shape, or (b) record watcher PIDs in a dedicated registry file so cleanup doesn't need heuristic pgrep.
 
-def _debug(msg: str) -> None:
-    if _DEBUG:
-        print(f"[cozempic.digest] {msg}", file=sys.stderr)
-
-# inside _to_prohibition:
-    text = text.strip()
-    if not text:
-        return ""
-    if len(text) > 200:
-        _debug(f"_to_prohibition rejected: len={len(text)} > 200 — {text[:60]!r}...")
-        return ""
-    if text.count("\n") > 2:
-        _debug(f"_to_prohibition rejected: multi-paragraph ({text.count(chr(10))} newlines) — {text[:60]!r}")
-        return ""
-    if text[0] in "<-*#`":
-        _debug(f"_to_prohibition rejected: structural-prefix {text[0]!r} — {text[:60]!r}")
-        return ""
-```
-
-Three debug emits — one per rejection branch. The `_DEBUG` flag is resolved at import time; tests can monkeypatch `digest._DEBUG = True` to exercise.
-
-### Test contracts (minimum 2)
-1. `test_debug_flag_off_no_stderr` — `COZEMPIC_DEBUG` unset, call `_to_prohibition("a" * 500)`, capture stderr via `capsys` (pytest), assert empty.
-2. `test_debug_flag_on_emits_length_rejection` — monkeypatch `digest._DEBUG = True`, call `_to_prohibition("a" * 500)`, stderr contains `"len=500 > 200"` AND `"_to_prohibition rejected"`.
-3. `test_debug_flag_on_emits_multiline_rejection` — monkeypatch `digest._DEBUG = True`, call `_to_prohibition("a\nb\nc\nd")`, stderr contains `"multi-paragraph"`.
-4. `test_to_prohibition_return_value_unchanged` (regression) — with `_DEBUG=True`, the return values for oversize/multiline/structural inputs are STILL `""` (behavior parity).
+**Not covered by existing tests**.
 
 ---
 
-## BUG-13 — `next_id` fallback after R999 produces a lexically-misordered ID
+### BUG-G3 — `_is_guard_running_for_session` missing PID-reuse defence (silent unprotected session)
 
-**Location**: `src/cozempic/digest.py:95-101`.
-**Verdict**: REAL
+**Severity**: HIGH
+**Location**: `guard.py:980-995`
 
-### Current code
-```python
-    def next_id(self) -> str:
-        existing = {r.id for r in self.all_rules()}
-        for i in range(1, 1000):
-            rid = f"R{i:03d}"
-            if rid not in existing:
-                return rid
-        return f"R{len(self.all_rules()) + 1:03d}"
+```
+980  def _is_guard_running_for_session(session_id: str) -> int | None:
+...
+989      try:
+990          pid = int(pid_path.read_text().strip())
+991          os.kill(pid, 0)
+992          return pid
 ```
 
-### Why it's a bug
-Two sub-issues:
+**Issue**: Only a liveness probe (`os.kill(pid, 0)`), **no argv verification**. Called by `start_guard_daemon` at lines 1060 and 1076 to decide `"already_running": True`. If the old daemon crashed and its PID was recycled to an unrelated process, this returns the recycled PID → `start_guard_daemon` returns `already_running=True` and **does not spawn a fresh daemon** → session is permanently unprotected. The asymmetry is striking: `reload_self_daemon` (line 1249) does verify via `_is_cozempic_guard_process`; `start_guard_daemon` does not.
 
-1. **Lexical sort breaks once 4-digit IDs appear.** Verified:
-   ```python
-   sorted(['R001', 'R999', 'R1000', 'R100']) → ['R001', 'R100', 'R1000', 'R999']
-   'R1000' > 'R999' → False
-   ```
-   After R999 fills up, the first fallback ID is `f"R{1000:03d}"` = `"R1000"` (4 chars — `:03d` is a MIN width, not a cap). Any caller that relies on ID sort order (e.g., display in `show_digest` line 974, or a future migration script) gets R1000 sorted BEFORE R999.
+The related comment at line 1284-1285 (`# not on already_running (that means a concurrent SessionStart hook already spawned...)`) assumes that `already_running=True` means a real daemon is up — which is invalidated by PID reuse.
 
-2. **Collision risk on sparse stores.** If a store has 900 rules with gaps (e.g., R001..R500 and R600..R999), the loop finds R501 as a gap — fine. But if ALL R001..R999 are taken AND the store has a gap previously filled with a 4-digit ID (e.g., R1000 was created, R500 was deleted, now len=999), the fallback returns `f"R{1000:03d}"` = "R1000" which COLLIDES with the existing R1000 that was never deleted. The loop never scanned i>999.
+**Repro**:
+1. Guard daemon crashes (uncaught exception, OOM, `kill -9`).
+2. `/tmp/cozempic_guard_<sess>.pid` still contains the dead PID.
+3. OS recycles that PID to any user process (browser tab, editor — common on Linux with high PID turnover).
+4. Next SessionStart hook → `start_guard_daemon` → `_is_guard_running_for_session` returns the recycled PID → session runs unprotected indefinitely.
 
-### Proposed fix (spec)
-Extend the loop range to cover any numeric ID, and use a stable width that handles 4+ digits without breaking lex sort:
+**Fix direction**: After the `os.kill(pid, 0)` probe, call `_is_cozempic_guard_process(pid)`; if it returns False, `pid_path.unlink(missing_ok=True)` and return None so caller respawns.
 
-**Option A (simplest — fix the loop ceiling and pad to 4 digits once >R999 is in play)**:
-```python
-    def next_id(self) -> str:
-        existing = {r.id for r in self.all_rules()}
-        # Find the smallest unused Rnnnn slot (nnnn >= 001).
-        for i in range(1, 10_000):
-            rid = f"R{i:04d}" if i >= 1000 else f"R{i:03d}"
-            if rid not in existing:
-                return rid
-        # Practical upper bound — the cap (MAX_ACTIVE_RULES=20) makes
-        # >9999 rules a cosmic-ray scenario, but fail loudly if hit.
-        raise RuntimeError("digest store exhausted R0001-R9999 id space")
-```
-
-**Option B (cleaner — always pad to 4 digits going forward, preserve legacy 3-digit IDs already on disk)**:
-```python
-    def next_id(self) -> str:
-        existing = {r.id for r in self.all_rules()}
-        for i in range(1, 10_000):
-            # Match legacy 3-digit shape for 1..999, then widen to 4.
-            rid = f"R{i:03d}" if i < 1000 else f"R{i:04d}"
-            if rid not in existing:
-                return rid
-        raise RuntimeError("digest store exhausted id space")
-```
-
-Option A/B are equivalent; pick A for consistency with the existing `:03d` idiom. Note: lexical sort still mixes R0999 vs R1000 IF we widened all IDs, but since MAX_ACTIVE_RULES=20 caps real usage far below 999, practical sort-order regressions are bounded to synthetic / migrated stores.
-
-### Test contracts (minimum 2)
-1. `test_next_id_after_r999_is_r1000_4digit` — populate 999 rules R001..R999 → `store.next_id()` returns `"R1000"` (currently also returns "R1000" — same on current code, but assert 4-digit format to lock in the width choice).
-2. `test_next_id_no_collision_on_full_plus_gap` — populate R001..R999 + R1000, remove R500 → `store.next_id()` returns `"R500"` (gap fill, not fallback to R1001) (currently: loop finds R500 → works; so this test is regression).
-3. `test_next_id_collision_when_all_3digit_filled_and_1000_exists` — populate R001..R999 AND R1000, delete none → `store.next_id()` returns `"R1001"` (currently returns `"R1000"` which COLLIDES — RED). This is the discriminating test.
-4. `test_ids_sort_chronologically_through_boundary` — add rules in sequence R998, R999, R1000, sort IDs → lex-sort must match insertion order (`["R998", "R999", "R1000"]`). Currently fails.
-
-**Risk**: `test_next_id_sequential` at `tests/test_digest.py:451` currently asserts `"R002"` after one rule — that contract holds. No test pins the 4-digit format, so widening is safe.
+**Not covered by existing tests** — `test_start_guard_daemon_passes_explicit_claude_pid_to_child` patches `_is_guard_running_for_session` entirely.
 
 ---
 
-## BUG-12 — `_to_prohibition` default branch produces malformed "Do not <digit><rest>"
+### BUG-G4 — TOCTOU race in PID file creation (orphan daemon)
 
-**Location**: `src/cozempic/digest.py:348-350`.
-**Verdict**: REAL
+**Severity**: HIGH
+**Location**: `guard.py:1058-1150`
 
-### Current code
-```python
-    # Default: prefix with "Do not"
-    if len(text) > 5:
-        return f"Do not {text[0].lower()}{text[1:]}"
-    return text
-```
+The window between the `_is_guard_running_for_session` check (line 1060 or 1076) and the unconditional `pid_path.write_text(str(proc.pid))` at line 1150 is not atomic. If two SessionStart hooks fire concurrently (the docs say this happens on multi-pane tmux / IDE + CLI startup):
 
-### Why it's a bug
-`text[0].lower()` is a no-op for any character that is not an uppercase letter — digits, punctuation, non-ASCII letters are passed through unchanged. Concrete outputs:
+1. Hook A: check → None → spawn Popen (PID 1001).
+2. Hook B: check → None (still no PID file) → spawn Popen (PID 1002).
+3. Hook A: write pid_file = "1001".
+4. Hook B: write pid_file = "1002".
 
-```python
-_to_prohibition("5xx errors must be retried") → "Do not 5xx errors must be retried"
-_to_prohibition("123 lines of config")         → "Do not 123 lines of config"
-_to_prohibition("%20 encoding")                → "Do not %20 encoding"
-_to_prohibition("émoji prefix")                → "Do not émoji prefix"  # acceptable
-```
+Result: two daemons running, pid_file points only at daemon B. Daemon A is **orphaned** — unreachable by `reload_self_daemon`, `_is_guard_running_for_session`, or doctor cleanup. It runs forever (or until its parent Claude exits via the line 414-422 watchdog). Both daemons race on the same prune lock and checkpoint file.
 
-Outputs like "Do not 5xx errors must be retried" are grammatically malformed — "Do not" requires a verb phrase, not a noun. These rules then get injected into Claude's context as hard prohibitions that no model can usefully apply.
+**Repro**: Start two `cozempic guard` invocations in tight succession (e.g., `cozempic guard --session X & cozempic guard --session X &`) — confirm two PIDs, one pid-file.
 
-**Bonus latent bug**: on short inputs (`len(text) <= 5`), the current code at line 351 `return text` returns the RAW input — not a prohibition, not the skip sentinel. Callers (`extract_corrections`) treat any non-empty return as a valid prohibition rule text. So `_to_prohibition("hi")` returns `"hi"` which then becomes a rule with text "hi" — not a prohibition. Fix below corrects this too.
+**Fix direction**: Create the pid file with `os.open(path, O_CREAT | O_EXCL | O_WRONLY)` **before** spawning Popen; if EEXIST, fall back to re-checking `_is_guard_running_for_session`. Write the spawned PID atomically via temp+rename.
 
-### Risk (elevated, flagged per prompt)
-**BREAKING** for users whose current rule text starts with a digit or punctuation. Before any fix merges, run a one-shot audit of existing `~/.cozempic/behavioral-digest.json` files:
-- If ZERO active rules have digit/punctuation first char → safe to reject in `_to_prohibition`
-- If N>0 active rules start with non-letter → the fix must either (a) sanitize (drop first non-letter run and capitalize the next letter), OR (b) reject AND demote existing rules via `load_digest_store` auto-migration path (the hook at line 641 already re-runs `_to_prohibition`, so existing rules that fail the new gate would auto-demote to pending — this is GOOD).
-
-Recommended direction: **reject** in `_to_prohibition` (return `""`), let auto-migration demote existing malformed rules on next load. Sanitization is tempting but introduces a new failure mode: a user rule "3xx redirects" becomes "Do not xx redirects" which changes meaning.
-
-### Proposed fix (spec)
-```python
-    # Default: prefix with "Do not" — require the first character to be a letter
-    # so the grammar is valid. Digit/punctuation-prefixed text is rejected
-    # (demoted to pending by the auto-migration path in load_digest_store).
-    if len(text) > 5 and text[0].isalpha():
-        return f"Do not {text[0].lower()}{text[1:]}"
-    return ""   # was `return text` — malformed output is worse than a skip
-```
-
-Two changes:
-1. Gate on `text[0].isalpha()` — rejects digit, punctuation, whitespace (already stripped), symbol leads.
-2. Return `""` (skip sentinel) instead of `text` when the guard fails. Returning `text` was also a latent bug: callers expect prohibition framing and get raw input, which then becomes a non-prohibition rule.
-
-### Test contracts (minimum 2)
-1. `test_digit_prefix_returns_empty` — `_to_prohibition("5xx errors must be retried")` returns `""` (currently returns malformed prohibition — RED).
-2. `test_punctuation_prefix_returns_empty` — `_to_prohibition("%20 encoding is bad")` returns `""`.
-3. `test_letter_prefix_still_works` — `_to_prohibition("add Co-Authored-By")` returns `"Do not add Co-Authored-By"` (regression).
-4. `test_short_input_returns_empty_not_raw` — `_to_prohibition("hi")` returns `""` (currently returns `"hi"` — latent bug fix).
-5. `test_existing_digit_prefix_rule_migrates_to_pending` — seed store with `DigestRule(id="R001", rule="5xx errors are bad", evidence="5xx errors are bad", status="active")`, call `load_digest_store`, assert `rule.status == "pending"` (auto-migration path).
-
-**Risk block**:
-> **Risk**: Users with rules like "3xx redirect handling" or "$VAR substitution" will see their rules demoted from active to pending on next cozempic invocation. Mitigation: the existing auto-migration path in `load_digest_store` (line 636-644) runs `_to_prohibition` on `rule.evidence or rule.rule` and demotes on empty — so this is already handled, just exercised. No user data loss (pending rules are retained, just not injected).
+**Not covered by existing tests**.
 
 ---
 
-## BUG-G13 — `_pid_file_for_session` uses 12-char truncation with no UUID validation (collision + path-traversal)
+### BUG-G5 — `_terminate_and_resume` SIGTERMs unverified `claude_pid` (PID reuse risk)
 
-**Location**: `src/cozempic/guard.py:1067-1070`.
-**Verdict**: REAL
+**Severity**: HIGH
+**Location**: `guard.py:804-894` (specifically 838, 862, 880, 890)
 
-### Current code
-```python
-def _pid_file_for_session(session_id: str) -> Path:
-    """Return the PID file path for a guard daemon watching a specific session."""
-    session_id = _normalize_session_id(session_id)
-    return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
+```
+837          if not _wait_for_exit(claude_pid, timeout=10.0):
+838              os.kill(claude_pid, signal.SIGTERM)
 ```
 
-### Why it's a bug
+**Issue**: `claude_pid` is resolved once at guard startup (line 388-389 via `find_claude_pid()`), stored across the whole daemon lifetime (cycles = hours or days). If Claude exits and respawns (user restarts), and the OS recycles the old Claude PID to another process, the next hard-prune cycle calls `_terminate_and_resume(stale_pid, ...)` → SIGTERM + SIGKILL on a recycled unrelated PID. The defence in `reload_self_daemon` (line 1268) is absent here.
 
-Two failure modes:
+Also, the tmux/screen paths (838, 862) SIGTERM the PID **without even re-checking liveness first** — only the plain-terminal path at line 880 is inside a `try/except ProcessLookupError`.
 
-1. **Truncation collision**. Session IDs passed in are expected to be UUIDs (8-4-4-4-12 hex, 36 chars). `session_id[:12]` = first 8 hex digits + `-` + 3 hex digits. Two UUIDs sharing the first 8 hex chars (2^32 ≈ 4B namespace) collide on the pidfile path. For a single user on one machine over years of usage, collision probability is negligible for true random UUIDs — but nothing enforces UUIDs. Any caller that passes a non-UUID session identifier (test harness, custom launcher, typo) can collide trivially.
+**Repro**:
+1. Start guard → find_claude_pid returns 5000.
+2. User SIGKILLs Claude externally. OS reassigns PID 5000 to another long-lived process.
+3. Session file grows (new Claude somewhere else writing to it, or manual append). Guard hits 55% threshold.
+4. Guard calls `_terminate_and_resume(5000, ...)` → SIGTERM to unrelated process.
 
-2. **Path traversal (security).** `_normalize_session_id` at line 61-65 only strips a `.jsonl` suffix via `Path.stem`. It does NOT validate that the remaining string is a UUID. A malicious / malformed `session_id = "../../etc/pa"` passes through untouched:
-   ```python
-   >>> Path("/tmp") / f"cozempic_guard_{'../../etc/pa'[:12]}.pid"
-   PosixPath('/tmp/cozempic_guard_../../etc/pa.pid')
-   >>> _.resolve()
-   PosixPath('/private/tmp/etc/pa.pid')
-   ```
-   This writes the daemon's PID file OUTSIDE `/tmp/cozempic_guard_*.pid` naming convention, breaking `doctor` cleanup (which globs `/tmp/cozempic_guard_*.pid`) AND potentially overwriting another user's files if `/tmp/etc/` is writable. Realistic attack requires controlling `session_id` input, which comes from CLI args and SessionStart hook — normal usage is UUID, but defense in depth is warranted.
+**Fix direction**: In `_terminate_and_resume`, before any signal, verify the PID is still a Claude Code process. Easiest check: `ps -p <pid> -o comm=` should contain `node` or `claude`. Mirror the same defence `reload_self_daemon` already has for guards.
 
-### Proposed fix (spec)
-Validate with a UUID regex. Reject non-UUID session_ids with `ValueError` (fail-fast — the CALLER is wrong). For backward compat during the transition, a relaxed regex matches "hex-only, at least 12 chars" which covers both UUIDs and any legitimate hex-derived identifier.
+Related: BUG-G8 below (watchdog at 414-422 correctly handles Claude-exit but `_terminate_and_resume` doesn't re-query fresh PID).
 
-```python
-import re
-
-_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{12,}$")
-
-def _pid_file_for_session(session_id: str) -> Path:
-    """Return the PID file path for a guard daemon watching a specific session.
-
-    Validates `session_id` against a UUID-shaped regex to prevent path-traversal
-    and filename collisions via non-hex input (BUG-G13).
-    """
-    session_id = _normalize_session_id(session_id)
-    if not _SESSION_ID_RE.fullmatch(session_id):
-        raise ValueError(
-            f"session_id must be a hex/UUID identifier, got {session_id!r}"
-        )
-    return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
-```
-
-Alternative (softer — sanitize instead of raise): replace non-hex chars with `_` before truncation. Rejected in favor of fail-fast because silent sanitization hides caller bugs.
-
-### Test contracts (minimum 2)
-1. `test_pid_file_uuid_valid` — `_pid_file_for_session("e6c3a4b2-1234-5678-9abc-def012345678")` returns `Path("/tmp/cozempic_guard_e6c3a4b2-12.pid")` (regression — current behavior preserved for real UUIDs).
-2. `test_pid_file_path_traversal_rejected` — `_pid_file_for_session("../../etc/pa")` raises `ValueError`.
-3. `test_pid_file_short_id_rejected` — `_pid_file_for_session("abc")` raises `ValueError`.
-4. `test_pid_file_jsonl_suffix_stripped` — `_pid_file_for_session("/path/e6c3a4b2-1234-5678-9abc-def012345678.jsonl")` returns pid path for the UUID (regression — `_normalize_session_id` still runs first).
-5. `test_pid_file_non_hex_chars_rejected` — `_pid_file_for_session("zzzzzzzzzzzzzz")` raises `ValueError`.
+**Not covered by existing tests**.
 
 ---
 
-## BUG-G16 — dead `_is_guard_running` shim returns None always, zero callers
+### BUG-G6 — `_spawn_reload_watcher` shell-injection sink on Windows + unquoted project_dir
 
-**Location**: `src/cozempic/guard.py:1141-1143`.
-**Verdict**: REAL — safe to delete.
+**Severity**: HIGH (Windows), MED (cross-platform)
+**Location**: `guard.py:925-928, 912-923`
 
-### Current code
-```python
-def _is_guard_running(cwd: str) -> int | None:
-    """Legacy check — scans for any guard PID file matching this CWD."""
-    return _is_guard_running_for_session(cwd)  # Won't match, but keeps signature
+```
+925      elif system == "Windows":
+926          resume_cmd = (
+927              f"start cmd /c \"cd /d {project_dir} && claude {resume_flag}\""
+928          )
 ```
 
-### Why it's a bug
-The function delegates to `_is_guard_running_for_session(cwd)` which expects a session_id (UUID), not a CWD. Internally, `_is_guard_running_for_session` calls `_normalize_session_id(cwd)` which does NOT coerce a CWD to a UUID — it just strips `.jsonl` suffix. The pidfile path then becomes `/tmp/cozempic_guard_{cwd[:12]}.pid` which never exists (daemons write to session-UUID pidfiles). Result: **always returns None**, regardless of daemon state.
+**Issue**: `project_dir` is interpolated **unquoted** into a Windows `cmd /c` shell string. A path containing `& shutdown /s /t 0 &` (or any cmd metachar) executes arbitrary commands. Paths with spaces also break. Linux/macOS paths go through `shell_quote`, but Windows does not. Concretely, any user whose project path contains `&`, `|`, `>`, `%`, or `^` triggers cmd injection at reload time.
 
-The function comment itself (`# Won't match, but keeps signature`) is a confession that this is a broken stub.
+Additionally, `resume_flag` on all platforms is constructed from `_detect_claude_flags(claude_pid)` output — **`original_flags` is not shell-quoted** (see BUG-G7). If the user launched Claude with a flag value containing `"` or `;`, those characters flow through `resume_cmd` into a shell string.
 
-### Caller count (verified across entire worktree, not just src/)
-```
-$ grep -rnE "_is_guard_running\b" src/ tests/ .claude-plugin/ plugin/
-src/cozempic/guard.py:1141: def _is_guard_running(cwd: str) -> int | None:
-```
-One hit — the definition itself. Zero callers in src/, zero in tests/, zero in plugin/ or .claude-plugin/. (A handful of text mentions in the stale `AUDIT_REPORT.md` and prose in `tests/test_guard_hardening.py` docstring — not callers.)
+**Repro**: Rename a Windows project dir to `My Project & calc &`; start guard; trigger threshold → `calc` launches.
 
-### Proposed fix (spec)
-Delete the function. No compat shim needed — private (leading-underscore) symbol, no external API.
+**Fix direction**: Quote `project_dir` on Windows with `subprocess.list2cmdline([...])` or pass via argv instead of a shell string. On all platforms, `shell_quote` each token of `original_flags` separately, not the whole joined string.
 
-```python
-# Lines 1141-1143 deleted.
-# Keep `_pid_file` alias at line 1137-1138 unchanged (it's tested by test_guard_robustness).
-```
-
-### Test contracts (minimum 2)
-1. `test_is_guard_running_removed` — `from cozempic import guard; assert not hasattr(guard, "_is_guard_running")`. (RED-aligned: passes only after deletion; currently fails because attr still exists.)
-2. `test_pid_file_alias_retained` — `from cozempic.guard import _pid_file; ...` still importable and returns `Path("/tmp/cozempic_guard_*.pid")` (regression — the OTHER legacy alias at line 1137 must NOT be deleted).
-3. (Optional) `test_no_dead_shim_for_session_variant` — assert `_is_guard_running_for_session` IS still exported (it's the live API).
+**Not covered by existing tests**.
 
 ---
 
-## Cross-cutting notes
+### BUG-G7 — `_detect_claude_flags` round-trip breaks on spaces/metachar
 
-- **Scope risk**: BUG-12 is the only bug in the batch with a real data-migration footprint (existing malformed rules will auto-demote). All other fixes are contained: BUG-9 persists one more field, A12 widens a regex, A2 adds opt-in stderr, BUG-13 widens id format forward-only, BUG-G13 validates input, BUG-G16 deletes dead code.
-- **Zero-dependency preserved**: A2 uses `os` + `sys` + `print`, BUG-G13 uses stdlib `re`. No new deps.
-- **Backward-compat**: existing 608-test suite expected to stay green. The `tests/test_digest.py::test_next_id_sequential` is the only test touching `next_id` and it operates below the R999 boundary.
-- **Commit atomicity**: 7 separate GREEN commits recommended. Each bug is independent except BUG-9 and A2 both touch imports (`os`/`sys`) — still independent at the function level.
-- **Test file placement**: Write tests as `TestPolishV2<BugName>` classes inside existing `tests/test_digest.py` (5 bugs) and `tests/test_guard_hardening.py` (2 bugs). DO NOT create a new `tests/test_polish_v2.py` — project convention groups tests by module under test, not by PR.
+**Severity**: MED
+**Location**: `guard.py:738-778`, consumed at `816`, `902`
+
+```
+749      args = result.stdout.strip()
+...
+754      parts = args.split()
+...
+776      return " ".join(cleaned)
+```
+
+**Issue**: `parts = args.split()` uses default whitespace split. `ps -o args=` returns a single space-separated line with no shell quoting preserved — a flag value containing a space (e.g., `--add-dir "/Users/foo/My Project"`) becomes two tokens `--add-dir` and `"/Users/foo/My`. The subsequent filter pipeline doesn't reconstitute them. The rejoined `original_flags` string is then interpolated into shell commands at lines 816, 846, 869, 914-923, 927 — **the shell re-parses the broken tokens** yielding either wrong args or, with embedded shell metachar (backticks, `$(...)`, `;`), command injection.
+
+Also line 772 (`if len(f) >= 32 and "-" in f and not f.startswith("-")`) treats any 32+ char token with dashes as a "session-id-like" argument and drops it — this eats legitimate long arguments (long file paths with dashes, repository names) silently.
+
+**Repro**: `claude --add-dir "/tmp/my project"` → start guard → reload → spawned `claude` receives `--add-dir /tmp/my` and loses the rest.
+
+**Fix direction**: Use `/proc/<pid>/cmdline` (NUL-separated, preserves boundaries) on Linux and the `argv` parsing trick on macOS (`ps` doesn't preserve argv boundaries reliably; consider `psutil.Process(pid).cmdline()` which correctly uses `proc_pidinfo` syscall).
+
+**Not covered by existing tests**.
 
 ---
 
-## Verification
-- Confidence: 95% (all 7 bugs reproduced against the current worktree source; fix specs grounded in the verified current behavior, not in the original prompt's hint text).
-- Signals (≥3 orthogonal):
-  - Source reads: `src/cozempic/digest.py` (lines 95-101, 172-176, 174, 309-351, 744-775) and `src/cozempic/guard.py` (lines 61-65, 1067-1070, 1099-1133, 1141-1143) via Read.
-  - Whole-worktree grep for `_is_guard_running\b` (zero callers verified).
-  - Python REPL reproduction of each failure mode (BUG-12 malformed output, BUG-13 lex sort, A12 `.islower()`, BUG-G13 path traversal via `Path.resolve`).
-  - Cross-check of `tests/test_digest.py` to confirm no existing test pins the buggy behavior (so fixes will not cascade into regressions).
-- Cross-checked: pidfile traversal resolution (`Path.resolve()` output captured), caller count of `_is_guard_running` via grep, mutation point of `store.session_id` at line 755 (BUG-9 root cause).
-- Not verified: live daemon behavior under the proposed fixes (that's task #4's job — validator). Whether any user on the fork has existing digit-prefixed rules (BUG-12 migration impact) — empirical check deferred to validator phase.
+### BUG-G8 — Claude watchdog (line 414-422) uses PID but doesn't verify it's still Claude
+
+**Severity**: MED
+**Location**: `guard.py:414-422`
+
+```
+414              if claude_pid and claude_alive:
+415                  try:
+416                      os.kill(claude_pid, 0)
+417                  except (ProcessLookupError, PermissionError):
+418                      claude_alive = False
+```
+
+**Issue**: Only liveness is checked. If Claude exited and its PID was recycled to a different long-running process, `os.kill(claude_pid, 0)` returns success → watchdog thinks Claude is still alive → guard runs forever checkpointing a dead Claude's session. Then when the 80% threshold hits, `_terminate_and_resume` SIGKILLs the recycled unrelated process (BUG-G5).
+
+**Repro**: same as BUG-G5. This is the upstream cause that propagates into BUG-G5.
+
+**Fix direction**: Instead of `os.kill(claude_pid, 0)`, verify the PID still corresponds to a Claude Code process (reuse the same `ps -p <pid> -o comm=` pattern as the `_is_cozempic_guard_process` helper, but match `node`/`claude`).
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G9 — `/tmp` log files grow unbounded across sessions
+
+**Severity**: MED
+**Location**: `guard.py:1099-1099`, `923` (watcher log)
+
+```
+1099  log_file = Path("/tmp") / f"cozempic_guard_{pid_key}.log"
+...
+1129      with open(log_file, "a", encoding="utf-8") as lf:
+```
+
+**Issue**: Log file is opened in append mode for every daemon spawn. Over many sessions, logs accumulate. On Linux (where `/tmp` is not tmpfs-cleared on reboot by default on some distros) and on long-uptime machines, these grow indefinitely. There's no rotation, no size cap, no cleanup on guard exit. Similarly, `/tmp/cozempic_guard.log` at line 923, 937 (the watcher log) is appended to by every reload.
+
+**Repro**: Run guard for a week with daily sessions; `du -sh /tmp/cozempic_guard_*.log` grows monotonically.
+
+**Fix direction**: Either (a) add a size check at daemon startup that truncates if the log exceeds N MB, or (b) use `RotatingFileHandler` via the logging module, or (c) use `~/.cache/cozempic/logs/` with a clean-on-startup policy. If `/tmp` is mounted `noexec` + `noatime`, opening for append still works; if it's read-only (rare), the `open(... "a")` at line 1129 raises and kills `start_guard_daemon` — BUG-G14 below.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G10 — `watcher_script` runs forever on recycled PID
+
+**Severity**: MED
+**Location**: `guard.py:933-946`
+
+```
+933      watcher_script = (
+934          f"while kill -0 {claude_pid} 2>/dev/null; do sleep 1; done; "
+935          f"sleep 1; "
+936          f"{resume_cmd}; "
+937          ...
+```
+
+**Issue**: The detached watcher polls `kill -0 claude_pid` every second. If Claude exits and the OS recycles `claude_pid` to a long-running unrelated process, the `while kill -0` loop never terminates — the watcher hangs forever consuming a shell process + 1s wake-ups. On a long-uptime machine, many reload cycles leak many zombies (well, orphaned-to-init bash processes — not zombies, but still leaked processes). Also, when `claude_pid` eventually does exit, the watcher unconditionally spawns `claude --resume` — even though the operator may not want another session.
+
+Also: `kill -0 {claude_pid}` interpolates an untrusted integer. The type annotation is `int`, but `_terminate_and_resume(claude_pid: int, ...)` gets its argument from `reload_pid = claude_pid if claude_pid is not None else find_claude_pid()` (line 699-702). If a future caller passes a non-int, this becomes a shell injection sink. LOW within current callers, but the contract is not defended (no `int(claude_pid)` guard).
+
+**Fix direction**: Add a maximum lifetime (e.g., `for i in $(seq 1 3600); do kill -0 ... || break; sleep 1; done` = 1-hour cap). Coerce `claude_pid` with `int(...)` before interpolation.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G11 — Reactive watcher thread is unreachable from signal handler (no join, orphaned state)
+
+**Severity**: MED
+**Location**: `guard.py:352-385`
+
+```
+355      if reactive:
+...
+373          watcher_thread = threading.Thread(
+374              target=overflow_watcher.start, daemon=True, name="cozempic-watcher",
+375          )
+376          watcher_thread.start()
+...
+379      def _graceful_shutdown(signum, frame):
+...
+382          if overflow_watcher:
+383              overflow_watcher.stop()
+384          sys.exit(0)
+```
+
+**Issue**: On SIGTERM, `_graceful_shutdown` calls `overflow_watcher.stop()` then `sys.exit(0)` — but `sys.exit()` in a signal handler raises `SystemExit` in the main thread. If the watcher is mid-callback (holding the session file open for a `recovery.on_file_growth` call), its cleanup is short-circuited. The daemon-thread semantics (`daemon=True` at 374) mean Python terminates it abruptly when main exits, bypassing any finally-block cleanup in `JsonlWatcher.start`. In practice this could leave open file handles on NFS / FUSE filesystems.
+
+Separately, `_graceful_shutdown` is only installed for SIGTERM (line 385). SIGINT (Ctrl-C) hits the `except KeyboardInterrupt` branch at line 569 which DOES call `overflow_watcher.stop()` but NOT in a signal-safe way (the `KeyboardInterrupt` is raised between bytecodes and the `except` runs in main thread). Mostly OK, but the asymmetry is a code smell — SIGHUP, SIGQUIT are not handled at all; they just terminate the daemon, leaking the watcher thread and any in-flight prune cycle.
+
+**Fix direction**: Register the same handler for SIGINT, SIGHUP, SIGQUIT. Use `threading.Event` to signal the watcher and `join(timeout=N)` before sys.exit. Move the signal installation earlier so it's active before the watcher thread starts.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G12 — `_graceful_shutdown` signal handler does non-reentrant I/O
+
+**Severity**: MED
+**Location**: `guard.py:379-385`
+
+```
+379      def _graceful_shutdown(signum, frame):
+380          print(f"\n  [{_now()}] Signal {signum} received — final checkpoint...")
+381          checkpoint_team(session_path=session_path, quiet=False)
+```
+
+**Issue**: The handler calls `print()` and `checkpoint_team()` — both do buffered I/O. If the main thread was holding the stdio lock (e.g., mid-`print(...)` or mid-`load_messages`) when the signal arrived, the handler deadlocks on the same lock. Python's GIL means handler re-entry is only between bytecodes, but once it runs, any `print` / file write contends with whatever lock the interrupted code was holding. This is a well-known Python hazard — see CPython `PEP 656` / `signal.signal` docs.
+
+A second SIGTERM arriving during the first handler would re-enter `checkpoint_team` → two writers to the same checkpoint file.
+
+**Fix direction**: Signal handler should only set a flag (`shutdown_requested = True`) and return. Main loop checks the flag after `time.sleep(interval)` at line 401 and performs the checkpoint + exit. This is the documented safe pattern.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G13 — `_pid_file_for_session` collision on 12-char truncation
+
+**Severity**: LOW
+**Location**: `guard.py:949-952`
+
+```
+949  def _pid_file_for_session(session_id: str) -> Path:
+950      """Return the PID file path for a guard daemon watching a specific session."""
+951      session_id = _normalize_session_id(session_id)
+952      return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
+```
+
+**Issue**: UUIDs are 36 chars. Truncating to 12 hex chars gives 48 bits of entropy. The probability of collision among two concurrent sessions on the same user is negligible (~1e-14 for 10 sessions), but the pid-file path is also used as a lock namespace. A deterministic truncation means two different full UUIDs that happen to share their first 12 chars (impossible in normal UUIDv4 but possible with crafted session IDs from tests / hooks passing unusual strings) both map to the same pid file → the second start silently returns `already_running=True` pointing at the wrong daemon.
+
+The function is also vulnerable to `session_id` values shorter than 12 chars — `session_id[:12]` returns `session_id` unchanged, which is fine, but the `_normalize_session_id` helper (line 53) only strips `.jsonl` suffix, not path components. If a caller passes `session_id="../../etc/passwd"`, the pid file becomes `/tmp/cozempic_guard_../../etc.pid` → the `..` components are preserved in the Path and could be used to probe arbitrary /tmp locations. Low impact (attack requires ability to pass arbitrary session_id), but worth tightening.
+
+**Fix direction**: Validate `session_id` is a UUID hex string before using it as a filename component. Use the full UUID (no truncation) — 36 extra bytes in the filename is cheap.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G14 — `start_guard_daemon` dies if `/tmp` is readonly (no error surfacing)
+
+**Severity**: LOW
+**Location**: `guard.py:1129-1150`
+
+```
+1129      with open(log_file, "a", encoding="utf-8") as lf:
+...
+1150      pid_path.write_text(str(proc.pid))
+```
+
+**Issue**: If `/tmp` is readonly (unusual but happens: Docker containers with `--read-only`, hardened systemd units with `PrivateTmp=yes` gone wrong, macOS SIP edge cases), `open(log_file, "a")` raises `PermissionError`. The function has no try/except → the exception propagates to the caller. If the caller is a hook (non-interactive, no stderr visible to user), the SessionStart hook fails silently → no guard protection and no user-visible error.
+
+Similarly, at line 1150 `pid_path.write_text(str(proc.pid))` runs AFTER `subprocess.Popen` has already spawned the daemon. If write fails, the daemon is orphaned (running with no pid file → unreachable).
+
+**Fix direction**: Catch filesystem errors around log/pid setup; fall back to `~/.cache/cozempic/` or the project dir; if all locations fail, return `{"started": False, "reason": "tmp unwritable"}` instead of raising.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G15 — `prune_with_team_protect` mutates caller's messages list in place
+
+**Severity**: LOW
+**Location**: `guard.py:189-204`
+
+```
+189      # 3. Tag team messages as protected (strategies skip via is_protected())
+190      tagged_indices: list[int] = []
+191      for _, msg_dict, _ in messages:
+192          if _is_team_message(msg_dict, pending_task_ids):
+193              msg_dict["__cozempic_team_protected__"] = True
+194              tagged_indices.append(id(msg_dict))
+...
+200      for _, msg_dict, _ in pruned_messages:
+201          msg_dict.pop("__cozempic_team_protected__", None)
+```
+
+**Issue**: The function tags messages in the caller's `messages` list with an in-band sentinel key. It only removes the tag from `pruned_messages` (which is the subset of survivors). Any messages DROPPED by `run_prescription` still carry the `__cozempic_team_protected__` key in memory — not a problem if they're garbage-collected, but if the caller retains a reference to the original list or if the messages dict identity leaks into other data structures, those dicts are left polluted.
+
+Much more important: the tag is written to `msg_dict` — which is the SAME dict object held in the loaded JSONL. If any downstream consumer serializes this dict back to disk (e.g., an error-path that writes the original messages after a PruneConflictError), the sentinel key `__cozempic_team_protected__` gets persisted in the on-disk session file. Claude Code itself won't interpret it, but it pollutes the on-disk format.
+
+The `tagged_indices` list is built but never used — dead code.
+
+**Fix direction**: Use a parallel `set()` of `id(msg_dict)` values as the protected-set instead of in-band mutation. `is_protected()` checks against the set. Zero mutation of caller data, no persistence risk.
+
+**Not covered by existing tests** — `test_guard_robustness.py` does not exercise `prune_with_team_protect`.
+
+---
+
+### BUG-G16 — `_is_guard_running` (legacy alias at line 1003-1005) always returns None
+
+**Severity**: LOW
+**Location**: `guard.py:998-1005`
+
+```
+1003  def _is_guard_running(cwd: str) -> int | None:
+1004      """Legacy check — scans for any guard PID file matching this CWD."""
+1005      return _is_guard_running_for_session(cwd)  # Won't match, but keeps signature
+```
+
+**Issue**: Comment says outright "Won't match". This is a broken compatibility shim — any legacy caller of `_is_guard_running(cwd)` gets None regardless of daemon state. The function should be either (a) removed if no external callers exist, or (b) implemented to actually scan for matching pid files. Leaving it as a silent no-op is worse than removing it: callers who still depend on it get misleading results.
+
+**Fix direction**: `grep -r '_is_guard_running\b' src/` to see if any live caller uses it. If none, delete. If yes, implement correctly.
+
+**Not covered by existing tests**.
+
+---
+
+### BUG-G17 — Reactive `OverflowRecovery` uses stale `claude_pid` captured at startup
+
+**Severity**: LOW
+**Location**: `guard.py:363-376`
+
+```
+363      breaker = CircuitBreaker(session_id=sess["session_id"])
+364      recovery = OverflowRecovery(
+365          session_path, sess["session_id"], cwd or os.getcwd(), breaker,
+366          danger_threshold_mb=danger_mb,
+367          danger_threshold_tokens=danger_tokens,
+368          claude_pid=claude_pid,
+369      )
+```
+
+**Issue**: `claude_pid` is passed by value to `OverflowRecovery` at daemon startup. The watcher thread runs for the daemon's entire lifetime. If Claude exits and is respawned (user resumed with a different PID, or upgraded), `OverflowRecovery.on_file_growth` still operates against the original PID — so when it triggers an emergency reload, it kills the wrong PID (or nothing at all if the PID is dead). The main loop has a Claude-exit watchdog at line 414-422, but it BREAKS OUT OF THE LOOP on exit — it does NOT update `claude_pid` if Claude respawns.
+
+**Fix direction**: Pass a `claude_pid_provider` callable (e.g., `find_claude_pid`) to `OverflowRecovery` instead of a static int. Let it re-resolve on each growth event.
+
+**Not covered by existing tests**.
+
+---
+
+## Non-bugs ruled out (with reasoning)
+
+- **`subprocess.run(..., shell=True)`**: none present — all `subprocess.run` calls pass argv lists (verified via `grep 'shell=True'` returned 0 results in guard.py). Subprocess output for `ps`, `pgrep`, `tmux`, `screen`, `osascript` uses argv directly.
+- **Signal re-entry on `SIGTERM` while handler runs**: Python serializes signal handlers — a second SIGTERM during the first handler's `checkpoint_team` call is queued, not re-entrant. Still, the handler does unsafe I/O (see BUG-G12) so this becomes moot.
+- **`flock` cross-filesystem issues**: `_PruneLock.__enter__` correctly handles `ImportError` (Windows) by setting `_fh = None`. On NFS, `fcntl.flock` typically silently succeeds without actual locking — real risk, but low concrete probability for `~/.claude/` (typically local). Flagged as a general concern but not a concrete bug.
+- **`find_claude_pid` walking up the process tree — infinite loop**: loop capped at 10 iterations (line 223) with `if pid <= 1: break` guard. OK.
+- **Backup cleanup at line 406 (`cleanup_old_backups(..., keep=3)`)**: correctly capped at 3 backups. OK.
+- **`_wait_for_exit` polling interval 0.2s**: bounded by `timeout` parameter. OK.
+- **`ping_install_if_new` + `maybe_auto_update(force=True)` at line 330-331**: does network I/O at daemon start — blocks startup. Could hang SessionStart hook. Not a concrete bug under normal network conditions but a resilience gap (not flagged here because outside guard.py scope and requires updater.py review).
+- **`consecutive_empty_hard_prunes` counter at line 534-538**: correctly implements exponential-ish backoff. OK.
+- **`_spawn_reload_watcher` `start_new_session=True`**: correctly detaches to init → no zombies.
+- **Integer overflow / unsigned wrapping**: no concrete risks identified — Python ints are arbitrary-precision; no C-int boundary.
+
+---
+
+## Summary
+
+- **Total**: 17 concrete bugs (**2 CRITICAL, 6 HIGH, 7 MED, 2 LOW**). All 17 uncovered by `tests/test_guard_robustness.py`.
+- **Theme**: The codebase has been hardened against PID reuse in `reload_self_daemon` (via `_is_cozempic_guard_process`), but the same defence was never propagated to `_cleanup_legacy_pid`, `_cleanup_stale_watchers`, `_is_guard_running_for_session`, `_terminate_and_resume`, and the main-loop Claude watchdog. This is the dominant bug class (G1, G2, G3, G5, G8) and represents the most exploitable surface — any PID-recycling scenario turns the daemon into a confused-deputy that signals unrelated user processes.
+- **Recommended fix-order**:
+  1. **CRITICAL first (G1, G2)**: gate every `os.kill(..., SIGTERM)` on `_is_cozempic_guard_process` (or a watcher-process equivalent). Smallest diff, biggest blast-radius reduction.
+  2. **HIGH (G3, G5, G8)**: propagate the same check to `_is_guard_running_for_session`, `_terminate_and_resume`, and the main-loop watchdog. Then (G4) harden PID-file creation to `O_CREAT|O_EXCL`. Then (G6, G7) quote/argv-sanitize all shell-interpolated strings.
+  3. **MED (G9-G12, G17)**: log rotation, watcher-lifetime cap, watcher-thread shutdown, signal-handler-does-only-set-flag refactor, dynamic PID re-resolution for reactive path.
+  4. **LOW (G13-G16)**: PID-filename hardening, fs-error handling in `start_guard_daemon`, clean up `prune_with_team_protect` in-band mutation, delete or fix `_is_guard_running`.
+- All 17 bugs are testable in isolation with mocks of `os.kill`, `subprocess.run`, `Path.exists`, `Path.write_text`. None require a live Claude process to repro.

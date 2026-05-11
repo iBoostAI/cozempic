@@ -38,14 +38,16 @@ PROMOTION_COUNT = 2  # Occurrences needed to promote pending → active (was 3, 
 DECAY_DAYS = 30  # Universal decay period (MemoryArena 2602.16313)
 
 # Opt-in stderr diagnostics for silent _to_prohibition rejections (A2).
-# Resolved at import time; tests monkeypatch `cozempic.digest._DEBUG` directly.
+# `_DEBUG` is kept as a module-level attribute for test monkeypatching;
+# `_debug()` also re-reads the env on each call so setting COZEMPIC_DEBUG=1
+# AFTER import (programmatic or shell-inherited mid-run) takes effect.
 # Runs inside hooks (PreCompact, Stop) where unconditional stderr would leak
 # to users — hence env-gated.
 _DEBUG = os.environ.get("COZEMPIC_DEBUG") == "1"
 
 
 def _debug(msg: str) -> None:
-    if _DEBUG:
+    if _DEBUG or os.environ.get("COZEMPIC_DEBUG") == "1":
         print(f"[cozempic.digest] {msg}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
@@ -191,8 +193,8 @@ def _is_system_noise(text: str) -> bool:
         return True
     # Tag-like: any line starting with '<' OR '/<' is synthetic. The '/<'
     # form appears in some wrapped emissions where a slash precedes the
-    # tag (R1-F13). File paths like `/Users/...` still pass because they
-    # start with '/' followed by a letter, not '<'.
+    # tag. File paths like `/Users/...` still pass because they start
+    # with '/' followed by a letter, not '<'.
     if stripped.startswith("<") or stripped.startswith("/<"):
         return True
     # Unicode tag-bracket lookalikes as LEADING char (A1 — fullwidth ＜, «, 〈).
@@ -348,9 +350,9 @@ def _to_prohibition(text: str) -> str:
     """
     text = text.strip()
     # Reject structural / oversize input — cannot be a clean correction.
-    # R1-F5: debug messages emit metadata only (length, newline count, single
-    # prefix char). Never echo raw user text — risk of PII / credentials
-    # leaking into stderr logs when COZEMPIC_DEBUG=1.
+    # Debug messages emit metadata only (length, newline count, single prefix
+    # char). Never echo raw user text — risk of PII / credentials leaking into
+    # stderr logs when COZEMPIC_DEBUG=1.
     if not text:
         return ""
     if len(text) > 200:
@@ -390,7 +392,7 @@ def _to_prohibition(text: str) -> str:
     # Default: prefix with "Do not". Require a letter lead so the grammar is
     # valid — digit/punctuation prefixes produce malformed prohibitions like
     # "Do not 5xx errors..." which no model can usefully follow (BUG-12).
-    # R1-F4: isalpha() gate applies regardless of length, so short digit-led
+    # The `isalpha()` gate applies regardless of length, so short digit-led
     # text ("5xx", "1st") is also rejected rather than returning raw.
     # Existing digit-prefixed active rules auto-demote via the load_digest_store
     # migration path which re-runs _to_prohibition on rule.evidence.
@@ -825,9 +827,9 @@ def update_digest(
     # advance even on rejected-only or zero-candidate runs so downstream
     # consumers can distinguish stale from fresh state. `save_digest_store`
     # is atomic (tmp+fsync+rename) and concurrent-merge-safe.
-    # R1-F6: readonly digest dir (Docker --read-only, hardened systemd,
-    # NFS quota hit) must not crash the hook. Degrade to in-memory only;
-    # disk catches up on the next call when the FS recovers.
+    # A readonly digest dir (Docker --read-only, hardened systemd, NFS quota
+    # hit) must not crash the hook. Degrade to in-memory only; disk catches
+    # up on the next call when the FS recovers.
     try:
         save_digest_store(store)
     except (OSError, PermissionError) as e:

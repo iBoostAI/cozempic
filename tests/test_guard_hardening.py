@@ -1809,21 +1809,27 @@ class TestPolishV2_BugG16DeadShimRemoved(unittest.TestCase):
 
 
 # ===========================================================================
-# RED TESTS — R1 adversarial findings (F1 HIGH, F2 MED, F8 LOW)
+# BUG-G13 follow-up hardening (adversarial review findings)
 # ===========================================================================
-# Mapping:
-#   F1 → TestPolishV2R1Fixes_F1LibraryCallerSafety
-#   F2 → TestPolishV2R1Fixes_F2UuidCaseNormalization
-#   F8 → TestPolishV2R1Fixes_F8ValueErrorMessageSanitization
+# Classes:
+#   TestPolishV2_IsGuardRunningSafeOnInvalidSession
+#     — `_is_guard_running_for_session` and `reload_self_daemon` must return
+#       safe defaults on invalid session_id instead of propagating ValueError
+#       from the pidfile helper.
+#   TestPolishV2_PidFileForSessionCaseNormalization
+#     — same UUID in different cases must map to the same pidfile path
+#       (prevents split-brain daemon spawning).
+#   TestPolishV2_PidFileForSessionValueErrorSanitization
+#     — ValueError message must not echo raw session_id content (PII risk).
 # ===========================================================================
 
 
-class TestPolishV2R1Fixes_F1LibraryCallerSafety(unittest.TestCase):
-    """F1 HIGH: `_pid_file_for_session` ValueError propagates through
-    library API callers (`_is_guard_running_for_session`, `reload_self_daemon`)
-    and crashes non-CLI callers. Fix: those wrappers must catch ValueError
-    and return a safe default (None / `reloaded=False, reason=...`).
-    Security contract: `_pid_file_for_session` itself STILL raises.
+class TestPolishV2_IsGuardRunningSafeOnInvalidSession(unittest.TestCase):
+    """`_pid_file_for_session` ValueError must NOT propagate through library
+    API callers (`_is_guard_running_for_session`, `reload_self_daemon`).
+    Those wrappers must catch ValueError and return safe defaults (None or
+    `reloaded=False, reason=...`) so non-CLI callers don't crash. Security
+    contract: `_pid_file_for_session` itself STILL raises on invalid input.
     """
 
     def test_is_guard_running_returns_none_on_invalid_session(self):
@@ -1860,10 +1866,11 @@ class TestPolishV2R1Fixes_F1LibraryCallerSafety(unittest.TestCase):
             _pid_file_for_session("not-a-uuid")
 
 
-class TestPolishV2R1Fixes_F2UuidCaseNormalization(unittest.TestCase):
-    """F2 MED: same logical UUID in different cases currently maps to
-    different pid file paths, enabling split-brain spawning of 2-3
-    daemons per session. Fix: normalize to lowercase BEFORE truncation.
+class TestPolishV2_PidFileForSessionCaseNormalization(unittest.TestCase):
+    """Same logical UUID in different cases must map to the SAME pidfile
+    path. Without case normalization, uppercase / mixed-case variants
+    previously mapped to different paths and enabled split-brain spawning
+    of 2-3 daemons per session. Fix: lowercase BEFORE truncation.
     """
 
     def test_uppercase_uuid_same_path_as_lowercase(self):
@@ -1873,7 +1880,7 @@ class TestPolishV2R1Fixes_F2UuidCaseNormalization(unittest.TestCase):
         self.assertEqual(
             _pid_file_for_session(lc),
             _pid_file_for_session(uc),
-            "UUID case variants mapped to different pid file paths — F2",
+            "UUID case variants mapped to different pid file paths",
         )
 
     def test_mixed_case_uuid_same_path_as_lowercase(self):
@@ -1883,7 +1890,7 @@ class TestPolishV2R1Fixes_F2UuidCaseNormalization(unittest.TestCase):
         self.assertEqual(
             _pid_file_for_session(lc),
             _pid_file_for_session(mc),
-            "mixed-case UUID produced different path — F2",
+            "mixed-case UUID produced different path",
         )
 
     def test_normalized_path_is_lowercase(self):
@@ -1895,11 +1902,10 @@ class TestPolishV2R1Fixes_F2UuidCaseNormalization(unittest.TestCase):
         self.assertIn("abcdef12-345", str(p))
 
 
-class TestPolishV2R1Fixes_F8ValueErrorMessageSanitization(unittest.TestCase):
-    """F8 LOW: ValueError message echoes the raw session_id via `!r`,
-    which can leak sensitive callers-input (API keys misclassified as
-    session ids) into exception logs. Fix: log type + length, never
-    raw content.
+class TestPolishV2_PidFileForSessionValueErrorSanitization(unittest.TestCase):
+    """ValueError message must NOT echo the raw session_id content via
+    `!r` — a misclassified API key / token passed as session_id would
+    otherwise leak into exception-handler logs. Log type + length only.
     """
 
     def test_value_error_message_does_not_echo_raw_session_id(self):
@@ -1909,7 +1915,7 @@ class TestPolishV2R1Fixes_F8ValueErrorMessageSanitization(unittest.TestCase):
             _pid_file_for_session(secret)
         self.assertNotIn(
             secret, str(ctx.exception),
-            "ValueError message leaked raw session_id — F8",
+            "ValueError message leaked raw session_id content",
         )
 
     def test_value_error_message_mentions_length(self):
@@ -1927,19 +1933,21 @@ class TestPolishV2R1Fixes_F8ValueErrorMessageSanitization(unittest.TestCase):
 
 
 # ===========================================================================
-# RED TESTS — R1-FIX-2 adversarial findings (F9/F10 MED)
+# BUG-G13 regex tightening — hex-digit-first requirement
 # ===========================================================================
-# F9/F10 → TestPolishV2R1Fixes_F9F10HexDigitRequired
+# Class:
+#   TestPolishV2_SessionIdRegexRequiresHexFirstChar
+#     — the relaxed regex `^[0-9a-fA-F-]{12,}$` accepted pure-dash and
+#       leading-dash strings (collision risk after [:12] truncation).
 # ===========================================================================
 
 
-class TestPolishV2R1Fixes_F9F10HexDigitRequired(unittest.TestCase):
-    """F9/F10 MED: `_SESSION_ID_RE = r'^[0-9a-fA-F-]{12,}$'` accepts
-    pure-dash and leading-dash strings because `-` is in the char class.
-    12 dashes → `/tmp/cozempic_guard_------------.pid` is a valid path,
-    and any two different-length all-dash inputs collide after [:12]
-    truncation. Fix: require at least one hex digit as the first char
-    — `^[0-9a-f][0-9a-f-]{11,}$`.
+class TestPolishV2_SessionIdRegexRequiresHexFirstChar(unittest.TestCase):
+    """`_SESSION_ID_RE` must reject pure-dash / leading-dash session ids.
+    The relaxed regex `^[0-9a-fA-F-]{12,}$` accepted them because `-` was
+    in the char class — `'-' * 12` validated, and any two all-dash inputs
+    of different lengths collided after `[:12]` truncation onto the same
+    pidfile path. Tightened regex requires a hex digit as the first char.
     """
 
     def test_pure_dashes_rejected(self):
@@ -1974,22 +1982,24 @@ class TestPolishV2R1Fixes_F9F10HexDigitRequired(unittest.TestCase):
 
 
 # ===========================================================================
-# RED TESTS — R1-FIX-3 adversarial finding (F16 CRIT)
+# BUG-G13 spawn-path validation (orphan-daemon prevention)
 # ===========================================================================
-# F16 → TestPolishV2R1Fixes_F16StartGuardDaemonValidation
+# Class:
+#   TestPolishV2_StartGuardDaemonValidatesSessionId
+#     — `start_guard_daemon` previously bypassed `_pid_file_for_session` and
+#       built its own pidfile path from `session_id[:12]`, spawning orphan
+#       daemons for non-UUID session ids.
 # ===========================================================================
 
 
-class TestPolishV2R1Fixes_F16StartGuardDaemonValidation(unittest.TestCase):
-    """F16 CRITICAL: `start_guard_daemon` bypasses `_pid_file_for_session`
-    and builds `pid_path`/`log_file` directly from `session_id[:12]`.
-    Result: a caller with a non-UUID session_id successfully spawns a
-    daemon at an unreachable pidfile path (orphan), and
-    `_is_guard_running_for_session` — which validates via the helper —
-    returns None, unable to find the caller's own daemon.
-
-    Fix: route the pidfile construction through `_pid_file_for_session`
-    and return `{started: False, reason: ...}` when the helper raises.
+class TestPolishV2_StartGuardDaemonValidatesSessionId(unittest.TestCase):
+    """`start_guard_daemon` must route pidfile construction through
+    `_pid_file_for_session`. Before the fix it built `pid_path` / `log_file`
+    directly from `session_id[:12]`, spawning daemons at paths the read-side
+    helper (`_is_guard_running_for_session`) couldn't find → orphan daemon,
+    no auto-reload path, no cleanup visibility. Now: on invalid session_id,
+    returns `{started: False, reason: "invalid session_id: ..."}` and
+    spawns nothing.
     """
 
     def test_invalid_session_id_does_not_spawn(self):
@@ -2002,7 +2012,7 @@ class TestPolishV2R1Fixes_F16StartGuardDaemonValidation(unittest.TestCase):
         )
         self.assertFalse(
             result.get("started"),
-            f"daemon spawned with invalid session_id — F16 orphan: {result}",
+            f"daemon spawned with invalid session_id — orphan: {result}",
         )
         self.assertIn("session", result.get("reason", "").lower())
 
@@ -2016,7 +2026,7 @@ class TestPolishV2R1Fixes_F16StartGuardDaemonValidation(unittest.TestCase):
         )
         self.assertFalse(
             result.get("started"),
-            f"daemon spawned with pure-dash session_id — F16/F9 cascade: {result}",
+            f"daemon spawned with pure-dash session_id: {result}",
         )
 
     def test_no_orphan_pidfile_on_invalid_session(self):
@@ -2046,11 +2056,11 @@ class TestPolishV2R1Fixes_F16StartGuardDaemonValidation(unittest.TestCase):
             o.unlink(missing_ok=True)
         self.assertFalse(
             result.get("started"),
-            "daemon spawned with invalid session_id — F16",
+            "daemon spawned with invalid session_id",
         )
         self.assertEqual(
             orphans, [],
-            f"orphan pidfile(s) left behind — F16: {[str(o) for o in orphans]}",
+            f"orphan pidfile(s) left behind: {[str(o) for o in orphans]}",
         )
 
 

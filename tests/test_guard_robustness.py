@@ -49,9 +49,9 @@ class TestGuardDaemonPidHandoff(unittest.TestCase):
         from cozempic.guard import start_guard_daemon
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Use a valid-shape UUID — R1-F16 requires hex/UUID session_id
-            # at the write-side (start_guard_daemon), matching the read-side
-            # contract in _pid_file_for_session.
+            # Use a valid-shape UUID — start_guard_daemon validates session_id
+            # via _pid_file_for_session (BUG-G13), matching the read-side
+            # contract in _is_guard_running_for_session.
             uuid = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
             session_log = Path("/tmp") / f"cozempic_guard_{uuid[:12]}.log"
             session_pid = Path("/tmp") / f"cozempic_guard_{uuid[:12]}.pid"

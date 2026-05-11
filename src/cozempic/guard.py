@@ -1067,9 +1067,10 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
 # UUID-shape / hex-only guard for session_id inputs to pidfile path composition
 # (BUG-G13). 12+ chars keeps the `[:12]` truncation meaningful; the hex+dash
 # character class rejects path-traversal sequences and any non-UUID identifier.
-# R1-F9/F10: require a hex digit as the first char so pure-dash / leading-dash
-# inputs reject — real UUIDs always start with a hex digit. Lowercase only
-# because `_pid_file_for_session` lowercases the input before matching (F2).
+# Require a hex digit as the first char so pure-dash / leading-dash inputs
+# reject — real UUIDs always start with a hex digit.
+# Note: `_pid_file_for_session` lowercases session_id BEFORE matching, so the
+# regex intentionally accepts lowercase hex only (not an RFC-4122 uppercase bug).
 _SESSION_ID_RE = re.compile(r"^[0-9a-f][0-9a-f-]{11,}$")
 
 
@@ -1080,11 +1081,11 @@ def _pid_file_for_session(session_id: str) -> Path:
     length >= 12) so that path-traversal sequences or stray filename tokens
     cannot escape `/tmp/cozempic_guard_*.pid` namespace — see BUG-G13.
     Normalizes to lowercase BEFORE truncation so different-case variants of
-    the same UUID map to the same pidfile (R1-F2 — prevents split-brain).
+    the same UUID map to the same pidfile (prevents split-brain spawning).
     Raises ValueError on malformed input so callers fail fast; library-API
     callers like `_is_guard_running_for_session` catch and return None
     (treat invalid session as "no daemon"). Error message logs only type
-    and length — never raw content — to avoid PII leaks (R1-F8).
+    and length — never raw content — to avoid PII leaks.
     """
     session_id = _normalize_session_id(session_id).lower()
     if not _SESSION_ID_RE.fullmatch(session_id):
@@ -1127,8 +1128,9 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     Returns the PID if running, None otherwise.
 
     An invalid `session_id` (non-UUID) is treated as "no daemon" (None)
-    rather than raising — R1-F1 library-API safety. Callers outside CLI
-    (hooks, pytest, third-party integrations) should get a safe default.
+    rather than raising — library-API safety. Callers outside the CLI
+    (hooks, pytest, third-party integrations) should get a safe default
+    instead of a ValueError propagating up from `_pid_file_for_session`.
     """
     norm_sid = _normalize_session_id(session_id)
     try:
@@ -1256,10 +1258,11 @@ def start_guard_daemon(
         session_id = _normalize_session_id(session_id)
 
     # Use session_id for PID file if available, fall back to CWD hash.
-    # R1-F16: route through `_pid_file_for_session` so the UUID-shape /
-    # lowercase / hex-first-char validation applies here too. Without this
-    # the write-side builds a different path than the read-side helper,
-    # and the caller's own daemon becomes an unreachable orphan.
+    # Route through `_pid_file_for_session` so the UUID-shape / lowercase /
+    # hex-first-char validation applies at the spawn path too. Without this
+    # the write-side builds a different path than the read-side helper
+    # (`_is_guard_running_for_session`), and the caller's own daemon becomes
+    # an unreachable orphan for non-UUID session ids.
     if session_id:
         try:
             pid_path = _pid_file_for_session(session_id)

@@ -2533,35 +2533,39 @@ class TestPolishV2_Bug12ToProhibitionDigitPrefix(unittest.TestCase):
 
 
 # ===========================================================================
-# RED TESTS — R1 adversarial findings (F4, F5, F6)
+# BUG-12 / BUG-9 / A2 follow-up hardening (adversarial review findings)
 # ===========================================================================
-# Mapping:
-#   F4 → TestPolishV2R1Fixes_F4BugTwelveShortBypass
-#   F5 → TestPolishV2R1Fixes_F5DebugPiiRedaction
-#   F6 → TestPolishV2R1Fixes_F6SaveDigestReadonlyGraceful
+# Classes:
+#   TestPolishV2_ToProhibitionShortNonLetterLead
+#     — BUG-12 fix originally gated isalpha() inside len>5, letting short
+#       digit/punctuation-led text through. Gate now applies to all lengths.
+#   TestPolishV2_ToProhibitionDebugPiiRedaction
+#     — A2 debug emission must not echo raw user text; metadata only.
+#   TestPolishV2_UpdateDigestSaveIoSafe
+#     — BUG-9's unconditional save must degrade gracefully on a readonly
+#       digest dir (Docker --read-only, hardened systemd, NFS quota).
 # ===========================================================================
 
 
-class TestPolishV2R1Fixes_F4BugTwelveShortBypass(unittest.TestCase):
-    """F4 MED: BUG-12 fix gated isalpha() inside `len > 5`, so short
-    digit-led text (`5xx`, `1st`) bypassed the check and returned raw.
-    Fix: apply isalpha() gate BEFORE the len>5 branch — non-letter
-    leads reject regardless of length.
+class TestPolishV2_ToProhibitionShortNonLetterLead(unittest.TestCase):
+    """BUG-12 follow-up: the initial fix gated `isalpha()` inside the
+    `len > 5` branch, so short digit-led text (`"5xx"`, `"1st"`) bypassed
+    the check and returned raw. The gate now applies regardless of length
+    — any non-letter lead rejects.
     """
 
     def test_short_digit_prefix_rejected(self):
-        """`_to_prohibition("5xx")` (len 3) must return '' — currently
-        bypasses the isalpha() gate via the len > 5 branch."""
+        """`_to_prohibition("5xx")` (len 3) must return ''."""
         self.assertEqual(
             _to_prohibition("5xx"), "",
-            "short digit-led text leaked past _to_prohibition — F4",
+            "short digit-led text leaked past _to_prohibition",
         )
 
     def test_short_punctuation_prefix_rejected(self):
         """Punctuation-led short text also rejected."""
         self.assertEqual(
             _to_prohibition("%foo"), "",
-            "short punctuation-led text leaked — F4",
+            "short punctuation-led text leaked past _to_prohibition",
         )
 
     def test_short_letter_prefix_still_returns_text(self):
@@ -2570,15 +2574,15 @@ class TestPolishV2R1Fixes_F4BugTwelveShortBypass(unittest.TestCase):
 
     def test_borderline_len_5_digit_prefix_rejected(self):
         """Exact-boundary case: `'1st hi'` is len 6 (already covered by
-        BUG-12) but `'1st'` is len 3 (bypasses). Confirm len 3 rejects."""
+        the len>5 branch) but `'1st'` is len 3 — must still reject."""
         self.assertEqual(_to_prohibition("1st"), "")
 
 
-class TestPolishV2R1Fixes_F5DebugPiiRedaction(unittest.TestCase):
-    """F5 MED: `_debug` emitted `{text[:60]!r}` — first 60 chars of raw
-    user text went to stderr, leaking credentials / PII into logs when
-    COZEMPIC_DEBUG=1. Fix: log metadata (length, newline count, single
-    char) but never raw content.
+class TestPolishV2_ToProhibitionDebugPiiRedaction(unittest.TestCase):
+    """A2 follow-up: `_debug` previously emitted `{text[:60]!r}` — first
+    60 chars of raw user text went to stderr, leaking credentials / PII
+    into logs when COZEMPIC_DEBUG=1. Messages now log metadata only
+    (length, newline count, single prefix char) — never raw content.
     """
 
     def test_length_rejection_does_not_echo_content(self):
@@ -2593,7 +2597,7 @@ class TestPolishV2R1Fixes_F5DebugPiiRedaction(unittest.TestCase):
             self.assertIn("len=", out, "still need length metadata")
             self.assertNotIn(
                 "MY_API_KEY_xyz_do_not_log_me", out,
-                "debug output leaked raw user text — F5 PII risk",
+                "debug output leaked raw user text — PII risk",
             )
 
     def test_multiline_rejection_does_not_echo_content(self):
@@ -2607,7 +2611,7 @@ class TestPolishV2R1Fixes_F5DebugPiiRedaction(unittest.TestCase):
             out = buf.getvalue()
             self.assertNotIn(
                 "hunter2", out,
-                "multiline debug output leaked secret — F5",
+                "multiline debug output leaked secret",
             )
 
     def test_structural_prefix_does_not_echo_full_content(self):
@@ -2622,16 +2626,17 @@ class TestPolishV2R1Fixes_F5DebugPiiRedaction(unittest.TestCase):
             out = buf.getvalue()
             self.assertNotIn(
                 "SECRET_TOKEN_xyz_goes_here", out,
-                "structural-prefix debug leaked raw content — F5",
+                "structural-prefix debug leaked raw content",
             )
 
 
-class TestPolishV2R1Fixes_F6SaveDigestReadonlyGraceful(unittest.TestCase):
-    """F6 MED: BUG-9's unconditional `save_digest_store` now crashes
-    `update_digest` when the digest dir is readonly (Docker --read-only,
-    hardened systemd, AFS/NFS quota). Fix: wrap save in try/except that
-    degrades gracefully — session state kept in-memory only, disk catches
-    up next call if FS recovers.
+class TestPolishV2_UpdateDigestSaveIoSafe(unittest.TestCase):
+    """BUG-9 follow-up: the unconditional `save_digest_store` call in
+    `update_digest` must not crash when the digest dir is readonly
+    (Docker --read-only, hardened systemd, AFS/NFS quota hit). The save
+    is wrapped in a try/except that degrades gracefully — session state
+    is kept in-memory only; disk catches up on the next call if the FS
+    recovers.
     """
 
     def setUp(self):
@@ -2682,17 +2687,21 @@ class TestPolishV2R1Fixes_F6SaveDigestReadonlyGraceful(unittest.TestCase):
 
 
 # ===========================================================================
-# RED TESTS — R1-FIX-2 adversarial findings (F13 MED)
+# A12 follow-up — slash-prefixed tag synthetic detection
 # ===========================================================================
-# F13 → TestPolishV2R1Fixes_F13SlashTagNoise
+# Class:
+#   TestPolishV2_IsSystemNoiseSlashPrefixedTag
+#     — `_is_system_noise` previously only checked `startswith('<')`; a
+#       leading slash before the tag (e.g. `/<tag>`) bypassed detection.
 # ===========================================================================
 
 
-class TestPolishV2R1Fixes_F13SlashTagNoise(unittest.TestCase):
-    """F13 MED: `_is_system_noise` only checks `stripped.startswith('<')`
-    for tag-like synthetic turns. A leading slash before the tag (e.g.
-    `/<tag>`) bypasses the check even though it's still a synthetic
-    emission. Fix: also match `startswith('/<')`.
+class TestPolishV2_IsSystemNoiseSlashPrefixedTag(unittest.TestCase):
+    """`_is_system_noise` must also classify `/<tag>` as synthetic. The
+    original check `stripped.startswith('<')` missed the slash-prefixed
+    tag form that some wrapped emissions produce. Fix also matches
+    `startswith('/<')`. A12 regression guard: `/Users/...` file paths
+    still pass through (they start with `/` followed by a letter).
     """
 
     def test_slash_tag_is_noise(self):
@@ -2700,7 +2709,7 @@ class TestPolishV2R1Fixes_F13SlashTagNoise(unittest.TestCase):
         from cozempic.digest import _is_system_noise
         self.assertTrue(
             _is_system_noise("/<tag>"),
-            "/<tag> leaked past noise filter — F13",
+            "/<tag> leaked past noise filter",
         )
 
     def test_slash_tag_with_content_is_noise(self):
@@ -2708,7 +2717,7 @@ class TestPolishV2R1Fixes_F13SlashTagNoise(unittest.TestCase):
         from cozempic.digest import _is_system_noise
         self.assertTrue(
             _is_system_noise("/<custom>content</custom>"),
-            "/<tag> with content leaked — F13",
+            "/<tag> with content leaked past noise filter",
         )
 
     def test_plain_tag_still_noise_regression(self):
@@ -2722,5 +2731,5 @@ class TestPolishV2R1Fixes_F13SlashTagNoise(unittest.TestCase):
         from cozempic.digest import _is_system_noise
         self.assertFalse(
             _is_system_noise("/Users/alice/foo.py needs a fix"),
-            "/Users/... file path wrongly flagged — F13 regressed A12",
+            "/Users/... file path wrongly flagged — A12 regression",
         )
