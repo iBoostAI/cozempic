@@ -2133,3 +2133,332 @@ class TestInferScopeEdgeCases(unittest.TestCase):
         from cozempic.digest import _infer_scope
         self.assertEqual(_infer_scope("co-authored-by me"), "git")
         self.assertEqual(_infer_scope("CO-AUTHORED-BY: ..."), "git")
+
+
+# ===========================================================================
+# RED TESTS — polish v2 (PR-A) — Bugs inventoried in AUDIT_REPORT.md (2026-05-11)
+# ===========================================================================
+#
+# These tests encode the POST-FIX contract for each bug. They MUST fail
+# against current v1.8.9 (RED) and pass after the implementer lands the
+# GREEN fix in task #3.
+#
+# Mapping (see AUDIT_REPORT.md in worktree root):
+#   BUG-9   → TestPolishV2_Bug9PersistOnRejected
+#   A12     → TestPolishV2_A12SlashCaseInsensitive
+#   A2      → TestPolishV2_A2ToProhibitionDebug
+#   BUG-13  → TestPolishV2_Bug13NextIdAfterR999
+#   BUG-12  → TestPolishV2_Bug12ToProhibitionDigitPrefix
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# BUG-9 — update_digest must persist session_id / updated timestamp even when
+# all candidates are rejected (mutation of store.session_id happens before the
+# persist gate, so the mutation is silently lost on rejected-only runs).
+# ---------------------------------------------------------------------------
+class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.digest_file = self.tmpdir / "behavioral-digest.json"
+        self.digest_md = self.tmpdir / "behavioral-digest.md"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _seed_store(self, session_id: str, updated: str) -> None:
+        """Write a baseline digest file with a known session_id and timestamp."""
+        payload = {
+            "version": 1,
+            "project": "/test",
+            "updated": updated,
+            "session_id": session_id,
+            "strategy_rules": [],
+            "failure_patterns": [],
+        }
+        self.digest_file.write_text(json.dumps(payload))
+
+    def test_rejected_only_persists_new_session_id(self):
+        """Pre-seed with session_id='old'. Feed messages that produce zero
+        admissions (all-noise / short). After update_digest, the on-disk
+        session_id MUST be 'new' — currently dropped because persist gate
+        skips save when added+upvoted==0.
+        """
+        self._seed_store(session_id="old", updated="2020-01-01T00:00:00+00:00")
+
+        # Messages that pass extract_corrections but are rejected by admit_rule
+        # are hard to fabricate deterministically. Use messages that produce
+        # candidates that admit_rule rejects. An easier RED: zero-candidate
+        # input still mutates store.session_id — verify that too.
+        # Use a noise-only message so extract_corrections returns 0 candidates.
+        messages = [make_user(0, "<system-reminder>noise</system-reminder>")]
+
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md):
+            added, upvoted, rejected = update_digest(
+                messages, project_dir="/test", session_id="new"
+            )
+            self.assertEqual((added, upvoted), (0, 0))
+
+            data = json.loads(self.digest_file.read_text())
+            self.assertEqual(
+                data["session_id"], "new",
+                "session_id was mutated in memory but not persisted when all "
+                "candidates were rejected — BUG-9 not fixed",
+            )
+
+    def test_rejected_only_bumps_updated_timestamp(self):
+        """Pre-seed with updated='2020-01-01'. After a rejected-only run the
+        on-disk `updated` timestamp must advance past 2020. Currently the file
+        stays at 2020 because save_digest_store is never called.
+        """
+        self._seed_store(session_id="s1", updated="2020-01-01T00:00:00+00:00")
+
+        messages = [make_user(0, "<tag>noise</tag>")]
+
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md):
+            update_digest(messages, project_dir="/test", session_id="s1")
+
+            data = json.loads(self.digest_file.read_text())
+            self.assertGreater(
+                data["updated"], "2020-01-01T99:99",
+                "updated timestamp not refreshed on rejected-only run — BUG-9",
+            )
+
+
+# ---------------------------------------------------------------------------
+# A12 — slash-command noise filter must match uppercase commands (/Compact,
+# /INIT). Current code uses .islower() which rejects any capitalized letter
+# at position [1].
+# ---------------------------------------------------------------------------
+class TestPolishV2_A12SlashCaseInsensitive(unittest.TestCase):
+
+    def test_compact_uppercase_is_noise(self):
+        """/Compact (title case) must be detected as a slash command."""
+        from cozempic.digest import _is_system_noise
+        self.assertTrue(
+            _is_system_noise("/Compact"),
+            "/Compact leaked past slash-command gate — A12",
+        )
+
+    def test_init_allcaps_is_noise(self):
+        """/INIT (all caps) must be detected as a slash command."""
+        from cozempic.digest import _is_system_noise
+        self.assertTrue(
+            _is_system_noise("/INIT"),
+            "/INIT leaked past slash-command gate — A12",
+        )
+
+    def test_file_path_users_is_not_noise(self):
+        """Regression: /Users/... absolute paths must NOT be flagged as slash
+        commands. The fix must disambiguate via the second slash."""
+        from cozempic.digest import _is_system_noise
+        self.assertFalse(
+            _is_system_noise("/Users/alice/foo.py needs a fix"),
+            "/Users/... file path wrongly flagged as slash command — regression",
+        )
+
+    def test_compact_lowercase_still_noise(self):
+        """Regression: existing /compact (lowercase) detection stays green."""
+        from cozempic.digest import _is_system_noise
+        self.assertTrue(_is_system_noise("/compact"))
+
+
+# ---------------------------------------------------------------------------
+# A2 — _to_prohibition must emit an opt-in debug line to stderr when
+# COZEMPIC_DEBUG=1 and the input is rejected (len>200, multi-paragraph, or
+# structural-prefix). Current code drops silently.
+# ---------------------------------------------------------------------------
+class TestPolishV2_A2ToProhibitionDebug(unittest.TestCase):
+
+    def test_debug_flag_off_no_stderr(self):
+        """With COZEMPIC_DEBUG unset / != '1', nothing is written to stderr
+        even when _to_prohibition rejects the input."""
+        import io
+        import contextlib
+        # Ensure flag is off
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COZEMPIC_DEBUG", None)
+            # Re-read the module's _DEBUG via monkeypatch if implemented:
+            with patch("cozempic.digest._DEBUG", False, create=True):
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    _to_prohibition("x" * 500)
+                self.assertEqual(
+                    buf.getvalue(), "",
+                    "_to_prohibition emitted to stderr with debug OFF — A2",
+                )
+
+    def test_debug_flag_on_emits_length_rejection(self):
+        """With _DEBUG=True, oversized input produces a stderr line that
+        identifies the rejection reason and the offending length."""
+        import io
+        import contextlib
+        with patch("cozempic.digest._DEBUG", True, create=True):
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _to_prohibition("a" * 500)
+            out = buf.getvalue()
+            self.assertIn(
+                "len=500", out,
+                "Expected length-rejection debug line with len=500 — A2",
+            )
+            self.assertIn(
+                "200", out,
+                "Expected debug message to mention the 200-char limit — A2",
+            )
+
+    def test_debug_flag_on_emits_multiline_rejection(self):
+        """Multi-paragraph inputs (>2 newlines) emit a multi-paragraph debug
+        line when _DEBUG=True."""
+        import io
+        import contextlib
+        with patch("cozempic.digest._DEBUG", True, create=True):
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _to_prohibition("a\nb\nc\nd")
+            out = buf.getvalue()
+            self.assertTrue(
+                "multi-paragraph" in out or "newlines" in out,
+                "Expected multi-paragraph debug line — A2",
+            )
+
+    def test_return_values_unchanged_when_debug_on(self):
+        """Regression: enabling debug MUST NOT change return values — A2 is
+        purely additive."""
+        with patch("cozempic.digest._DEBUG", True, create=True):
+            self.assertEqual(_to_prohibition("a" * 500), "")
+            self.assertEqual(_to_prohibition("a\nb\nc\nd"), "")
+            # structural-prefix branch
+            self.assertEqual(_to_prohibition("- bullet item"), "")
+
+
+# ---------------------------------------------------------------------------
+# BUG-13 — next_id must avoid collision once R001..R999 AND R1000 are all
+# present. Current loop ranges 1..1000 only, so the fallback at line 101 can
+# return "R1000" even when R1000 already exists.
+# ---------------------------------------------------------------------------
+class TestPolishV2_Bug13NextIdAfterR999(unittest.TestCase):
+
+    def test_no_collision_when_all_3digit_plus_r1001_exists(self):
+        """Discriminating RED case per audit: R001..R999 all taken AND R1001
+        is ALSO present (e.g., a 4-digit ID was pre-seeded / migrated).
+        len(all_rules)=1000, so the current fallback returns
+        f'R{1001:03d}' = 'R1001' — which COLLIDES with the existing R1001.
+        The fix must return any unused id (not one already in existing)."""
+        from cozempic.digest import DigestStore, DigestRule
+        store = DigestStore()
+        for i in range(1, 1000):
+            store.strategy_rules.append(DigestRule(id=f"R{i:03d}", rule="x"))
+        # Pre-seed R1001 (not R1000) — this is the case the fallback misses.
+        store.strategy_rules.append(DigestRule(id="R1001", rule="x"))
+
+        rid = store.next_id()
+        existing = {r.id for r in store.strategy_rules}
+        self.assertNotIn(
+            rid, existing,
+            f"next_id() returned {rid!r} which already exists — BUG-13 collision",
+        )
+
+    def test_no_collision_when_fallback_would_duplicate(self):
+        """Generic collision guard: for ANY store configuration, next_id
+        must never return an id already in the store. This is the universal
+        contract BUG-13 violates when the fallback uses len+1 without
+        consulting `existing`."""
+        from cozempic.digest import DigestStore, DigestRule
+        store = DigestStore()
+        # Fill R001..R999 AND R1002 (len = 1000, fallback = R1001, safe).
+        # Then ALSO add R1001 — len = 1001, fallback = f"R{1002:03d}" = R1002
+        # which collides.
+        for i in range(1, 1000):
+            store.strategy_rules.append(DigestRule(id=f"R{i:03d}", rule="x"))
+        store.strategy_rules.append(DigestRule(id="R1001", rule="x"))
+        store.strategy_rules.append(DigestRule(id="R1002", rule="x"))
+
+        rid = store.next_id()
+        existing = {r.id for r in store.strategy_rules}
+        self.assertNotIn(
+            rid, existing,
+            f"next_id() fallback produced collision {rid!r} — BUG-13",
+        )
+
+    def test_ids_sort_chronologically_through_boundary(self):
+        """Post-fix contract: IDs issued sequentially around the R999/R1000
+        boundary must lex-sort in creation order. Under the current 3-digit
+        min-width format, 'R1000' sorts BEFORE 'R999' (lex) — which breaks
+        `sorted(ids)` in show_digest and any migration script.
+
+        Fix must widen the padding (R0999 < R1000 lex) so IDs remain sortable.
+        """
+        from cozempic.digest import DigestStore, DigestRule
+        store = DigestStore()
+        # Pre-fill 998 rules, then issue 3 more via next_id()
+        for i in range(1, 999):
+            store.strategy_rules.append(DigestRule(id=f"R{i:03d}", rule="x"))
+        issued = []
+        for _ in range(3):
+            rid = store.next_id()
+            issued.append(rid)
+            store.strategy_rules.append(DigestRule(id=rid, rule="x"))
+
+        self.assertEqual(
+            sorted(issued), issued,
+            f"IDs issued sequentially do not lex-sort in order: {issued} — "
+            "BUG-13 width regression (R1000 sorts before R999 lexically).",
+        )
+
+    def test_next_id_fills_gap_below_r1000(self):
+        """Regression / discriminator: a mid-range gap below R1000 is still
+        filled first, even if R1000 exists. Proves the fix doesn't skip the
+        legacy 3-digit slots."""
+        from cozempic.digest import DigestStore, DigestRule
+        store = DigestStore()
+        for i in range(1, 1000):
+            if i == 500:
+                continue  # gap
+            store.strategy_rules.append(DigestRule(id=f"R{i:03d}", rule="x"))
+        store.strategy_rules.append(DigestRule(id="R1000", rule="x"))
+        self.assertEqual(
+            store.next_id(), "R500",
+            "next_id must fill 3-digit gap before issuing 4-digit IDs",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BUG-12 — _to_prohibition must reject inputs whose first character is not
+# a letter. Current code produces "Do not 5xx errors..." which is grammatically
+# malformed and unsuitable for prohibition injection.
+# ---------------------------------------------------------------------------
+class TestPolishV2_Bug12ToProhibitionDigitPrefix(unittest.TestCase):
+
+    def test_digit_prefix_returns_empty(self):
+        """A digit-prefixed input returns '' (skip sentinel). Currently
+        returns 'Do not 5xx errors must be retried' — malformed."""
+        self.assertEqual(
+            _to_prohibition("5xx errors must be retried"), "",
+            "digit-prefixed input produced a prohibition — BUG-12",
+        )
+
+    def test_punctuation_prefix_returns_empty(self):
+        """Percent / symbol / punctuation leading char — reject."""
+        self.assertEqual(
+            _to_prohibition("%20 encoding is bad"), "",
+            "punctuation-prefixed input produced a prohibition — BUG-12",
+        )
+
+    def test_letter_prefix_still_works(self):
+        """Regression: letter-prefixed input still produces a prohibition."""
+        self.assertEqual(
+            _to_prohibition("add Co-Authored-By"),
+            "Do not add Co-Authored-By",
+        )
+
+    def test_short_input_still_returns_text(self):
+        """Regression: the len<=5 short-input branch is unchanged; it
+        returns the input verbatim (no 'Do not' prefix)."""
+        self.assertEqual(_to_prohibition("hi"), "hi")

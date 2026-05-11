@@ -1699,5 +1699,114 @@ class TestR3_4_PosixPlainTerminalSigtermHasInnerReverify(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# RED TESTS — polish v2 (PR-A) — Bugs from AUDIT_REPORT.md (2026-05-11)
+# ===========================================================================
+#
+# Mapping:
+#   BUG-G13 → TestPolishV2_BugG13PidFileUuidValidation
+#   BUG-G16 → TestPolishV2_BugG16DeadShimRemoved
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# BUG-G13 — _pid_file_for_session must validate session_id as UUID/hex before
+# composing the pidfile path. Current code passes arbitrary strings through to
+# Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid" enabling both
+# filename collisions and path-traversal writes.
+# ---------------------------------------------------------------------------
+class TestPolishV2_BugG13PidFileUuidValidation(unittest.TestCase):
+
+    def test_uuid_valid_returns_expected_path(self):
+        """Regression: a well-formed UUID session_id still maps to the
+        expected '/tmp/cozempic_guard_<first-12>.pid' path."""
+        from cozempic.guard import _pid_file_for_session
+        uuid = "e6c3a4b2-1234-5678-9abc-def012345678"
+        p = _pid_file_for_session(uuid)
+        self.assertEqual(
+            p, Path("/tmp") / f"cozempic_guard_{uuid[:12]}.pid",
+            "valid UUID should still produce the canonical pidfile path",
+        )
+
+    def test_path_traversal_session_id_rejected(self):
+        """A session_id containing path-traversal sequences (../../etc/pa)
+        MUST raise ValueError. Currently it silently composes a path that
+        resolves outside /tmp/cozempic_guard_*.pid."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(
+            ValueError,
+            msg="path-traversal session_id was accepted — BUG-G13",
+        ):
+            _pid_file_for_session("../../etc/pa")
+
+    def test_non_hex_session_id_rejected(self):
+        """A session_id of the right length but containing non-hex characters
+        MUST raise ValueError."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(
+            ValueError,
+            msg="non-hex session_id was accepted — BUG-G13",
+        ):
+            _pid_file_for_session("zzzzzzzzzzzzzzzz")
+
+    def test_short_session_id_rejected(self):
+        """Session IDs shorter than the validation minimum MUST raise."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(
+            ValueError,
+            msg="too-short session_id was accepted — BUG-G13",
+        ):
+            _pid_file_for_session("abc")
+
+    def test_jsonl_suffix_stripped_then_validated(self):
+        """Regression: _normalize_session_id still runs first, so
+        '/path/<uuid>.jsonl' -> extract UUID -> validation passes."""
+        from cozempic.guard import _pid_file_for_session
+        uuid = "e6c3a4b2-1234-5678-9abc-def012345678"
+        # pass path with .jsonl suffix — normalization picks the stem
+        p = _pid_file_for_session(f"/some/path/{uuid}.jsonl")
+        self.assertEqual(
+            p, Path("/tmp") / f"cozempic_guard_{uuid[:12]}.pid",
+            "jsonl-stripped UUID should validate and map correctly",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G16 — dead shim _is_guard_running (zero callers) must be removed.
+# Contract is existence-based: after the fix, the symbol is gone from the
+# module. This protects against future regressions where the shim is
+# re-introduced and silently returns None.
+# ---------------------------------------------------------------------------
+class TestPolishV2_BugG16DeadShimRemoved(unittest.TestCase):
+
+    def test_is_guard_running_symbol_removed(self):
+        """The broken legacy shim _is_guard_running must not exist anymore
+        (zero callers in src/, tests/, or plugin/)."""
+        from cozempic import guard
+        self.assertFalse(
+            hasattr(guard, "_is_guard_running"),
+            "_is_guard_running legacy shim still present — BUG-G16 not fixed",
+        )
+
+    def test_is_guard_running_for_session_still_exported(self):
+        """Regression guard: the LIVE session-scoped helper remains
+        exported — it's the real API."""
+        from cozempic import guard
+        self.assertTrue(
+            hasattr(guard, "_is_guard_running_for_session"),
+            "_is_guard_running_for_session wrongly removed — regression",
+        )
+
+    def test_pid_file_alias_retained(self):
+        """Regression: the OTHER legacy alias `_pid_file` (cwd→Path, used by
+        test_guard_robustness) must NOT be deleted alongside the shim."""
+        from cozempic.guard import _pid_file
+        p = _pid_file("/tmp/some/cwd")
+        self.assertTrue(
+            str(p).startswith("/tmp/cozempic_guard_"),
+            "_pid_file legacy alias signature broken — regression",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
