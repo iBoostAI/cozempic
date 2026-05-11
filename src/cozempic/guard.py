@@ -1138,11 +1138,6 @@ def _pid_file(cwd: str) -> Path:
     return _pid_file_for_cwd(cwd)
 
 
-def _is_guard_running(cwd: str) -> int | None:
-    """Legacy check — scans for any guard PID file matching this CWD."""
-    return _is_guard_running_for_session(cwd)  # Won't match, but keeps signature
-
-
 def start_guard_daemon(
     cwd: str | None = None,
     threshold_mb: float = 50.0,
