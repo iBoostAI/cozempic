@@ -1926,5 +1926,52 @@ class TestPolishV2R1Fixes_F8ValueErrorMessageSanitization(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# RED TESTS — R1-FIX-2 adversarial findings (F9/F10 MED)
+# ===========================================================================
+# F9/F10 → TestPolishV2R1Fixes_F9F10HexDigitRequired
+# ===========================================================================
+
+
+class TestPolishV2R1Fixes_F9F10HexDigitRequired(unittest.TestCase):
+    """F9/F10 MED: `_SESSION_ID_RE = r'^[0-9a-fA-F-]{12,}$'` accepts
+    pure-dash and leading-dash strings because `-` is in the char class.
+    12 dashes → `/tmp/cozempic_guard_------------.pid` is a valid path,
+    and any two different-length all-dash inputs collide after [:12]
+    truncation. Fix: require at least one hex digit as the first char
+    — `^[0-9a-f][0-9a-f-]{11,}$`.
+    """
+
+    def test_pure_dashes_rejected(self):
+        """12 dashes is not a UUID; must reject."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(ValueError):
+            _pid_file_for_session("-" * 12)
+
+    def test_leading_dash_rejected(self):
+        """UUID-shape requires a hex digit (not dash) in position 0."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(ValueError):
+            _pid_file_for_session("-abcdef123456789abcdef")
+
+    def test_dash_collision_prevented(self):
+        """Before fix: `-` * 12 and `-` * 18 accept AND collide after
+        [:12] truncation. After fix: both reject."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(ValueError):
+            _pid_file_for_session("-" * 12)
+        with self.assertRaises(ValueError):
+            _pid_file_for_session("-" * 18)
+
+    def test_valid_hex_uuid_still_accepted(self):
+        """Regression: real UUID (hex lead) still works."""
+        from cozempic.guard import _pid_file_for_session
+        uuid = "e6c3a4b2-1234-5678-9abc-def012345678"
+        p = _pid_file_for_session(uuid)
+        self.assertEqual(
+            p, Path("/tmp") / f"cozempic_guard_{uuid[:12]}.pid",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2679,3 +2679,48 @@ class TestPolishV2R1Fixes_F6SaveDigestReadonlyGraceful(unittest.TestCase):
                 mock_save.called,
                 "save_digest_store was not called — BUG-9 regression",
             )
+
+
+# ===========================================================================
+# RED TESTS — R1-FIX-2 adversarial findings (F13 MED)
+# ===========================================================================
+# F13 → TestPolishV2R1Fixes_F13SlashTagNoise
+# ===========================================================================
+
+
+class TestPolishV2R1Fixes_F13SlashTagNoise(unittest.TestCase):
+    """F13 MED: `_is_system_noise` only checks `stripped.startswith('<')`
+    for tag-like synthetic turns. A leading slash before the tag (e.g.
+    `/<tag>`) bypasses the check even though it's still a synthetic
+    emission. Fix: also match `startswith('/<')`.
+    """
+
+    def test_slash_tag_is_noise(self):
+        """`/<tag>` must be classified as synthetic noise."""
+        from cozempic.digest import _is_system_noise
+        self.assertTrue(
+            _is_system_noise("/<tag>"),
+            "/<tag> leaked past noise filter — F13",
+        )
+
+    def test_slash_tag_with_content_is_noise(self):
+        """`/<custom>content</custom>` also synthetic."""
+        from cozempic.digest import _is_system_noise
+        self.assertTrue(
+            _is_system_noise("/<custom>content</custom>"),
+            "/<tag> with content leaked — F13",
+        )
+
+    def test_plain_tag_still_noise_regression(self):
+        """Regression: existing `<tag>` detection unchanged."""
+        from cozempic.digest import _is_system_noise
+        self.assertTrue(_is_system_noise("<tag>"))
+
+    def test_file_path_still_not_noise_regression(self):
+        """Regression: A12 boundary preserved — `/Users/...` paths
+        must NOT trigger the slash-tag detection."""
+        from cozempic.digest import _is_system_noise
+        self.assertFalse(
+            _is_system_noise("/Users/alice/foo.py needs a fix"),
+            "/Users/... file path wrongly flagged — F13 regressed A12",
+        )
