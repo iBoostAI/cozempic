@@ -108,9 +108,8 @@ class DigestStore:
 
     def next_id(self) -> str:
         # Gap-aware: find the smallest unused Rnnnn slot. Widen from 3 to 4
-        # digits past R999 so IDs stay lex-sortable through the boundary
-        # (R0999 < R1000) and the fallback never collides with an existing
-        # 4-digit ID — see BUG-13.
+        # digits past R999 so the fallback never collides with an existing
+        # 4-digit ID on stores that already contain R1000+.
         existing = {r.id for r in self.all_rules()}
         for i in range(1, 10_000):
             rid = f"R{i:03d}" if i < 1000 else f"R{i:04d}"
@@ -391,10 +390,10 @@ def _to_prohibition(text: str) -> str:
 
     # Default: prefix with "Do not". Require a letter lead so the grammar is
     # valid — digit/punctuation prefixes produce malformed prohibitions like
-    # "Do not 5xx errors..." which no model can usefully follow (BUG-12).
-    # The `isalpha()` gate applies regardless of length, so short digit-led
-    # text ("5xx", "1st") is also rejected rather than returning raw.
-    # Existing digit-prefixed active rules auto-demote via the load_digest_store
+    # "Do not 5xx errors..." which no model can usefully follow. The
+    # `isalpha()` gate applies regardless of length, so short digit-led text
+    # ("5xx", "1st") is also rejected rather than returning raw. Existing
+    # digit-prefixed active rules auto-demote via the load_digest_store
     # migration path which re-runs _to_prohibition on rule.evidence.
     if not text[0].isalpha():
         _debug(f"_to_prohibition rejected: non-letter lead {text[0]!r}")
@@ -822,11 +821,11 @@ def update_digest(
         else:
             rejected += 1
 
-    # Persist unconditionally — BUG-9. `store.session_id` is mutated above
-    # regardless of the admission outcome, and `updated` timestamp must
-    # advance even on rejected-only or zero-candidate runs so downstream
-    # consumers can distinguish stale from fresh state. `save_digest_store`
-    # is atomic (tmp+fsync+rename) and concurrent-merge-safe.
+    # Persist unconditionally: `store.session_id` is mutated above regardless
+    # of the admission outcome, and `updated` timestamp must advance even on
+    # rejected-only or zero-candidate runs so downstream consumers can
+    # distinguish stale from fresh state. `save_digest_store` is atomic
+    # (tmp+fsync+rename) and concurrent-merge-safe.
     # A readonly digest dir (Docker --read-only, hardened systemd, NFS quota
     # hit) must not crash the hook. Degrade to in-memory only; disk catches
     # up on the next call when the FS recovers.

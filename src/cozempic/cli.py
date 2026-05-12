@@ -1586,10 +1586,10 @@ def main():
         commands[args.command](args)
     except ValueError as e:
         # Narrow catch: the `guard` / `reload` subcommands build pidfile
-        # paths via `_pid_file_for_session` (BUG-G13) which raises on
-        # malformed session_id. Surface those as a clean one-line error
-        # instead of a Python traceback. Re-raise for any other command
-        # so bugs aren't silently swallowed.
+        # paths via `_pid_file_for_session` which raises on malformed
+        # session_id. Surface those as a clean one-line error instead of
+        # a Python traceback. Re-raise for any other command so bugs
+        # aren't silently swallowed.
         if args.command in ("guard", "reload"):
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
