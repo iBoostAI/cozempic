@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -507,6 +508,7 @@ def load_messages(path: Path) -> list[Message]:
 # _FileSnapshot for append-aware conflict detection.
 
 MAX_CACHED_MESSAGES = 5000  # per-session cache cap; evicts oldest on overflow
+MAX_CACHE_SESSIONS = 8      # LRU cap on distinct session paths held at once
 
 
 @dataclass
@@ -519,7 +521,10 @@ class _CacheEntry:
     next_line_index: int = 0  # running file-line counter for Message tuples
 
 
-_INCR_CACHE: dict[Path, _CacheEntry] = {}
+# OrderedDict supports move_to_end / popitem(last=False) for LRU bookkeeping.
+# The per-path cache covers the guard daemon (one session) but also any
+# library-API consumer that iterates many sessions in a long-lived process.
+_INCR_CACHE: "OrderedDict[Path, _CacheEntry]" = OrderedDict()
 _INCR_LOCK = threading.Lock()
 
 
@@ -572,6 +577,7 @@ def load_messages_incremental(path: Path) -> list[Message]:
 
     Thread-safe via a module-global lock.
     """
+    path = Path(path)
     key = path.resolve()
     with _INCR_LOCK:
         try:
@@ -581,11 +587,15 @@ def load_messages_incremental(path: Path) -> list[Message]:
             return []
 
         entry = _INCR_CACHE.get(key)
+        # Same-size in-place rewrite (open('r+')): inode holds, size holds,
+        # but mtime advances. Treat that as a cache-miss — otherwise the
+        # early-exit would return the pre-rewrite content.
         needs_full_read = (
             entry is None
             or st.st_ino != entry.inode
             or st.st_size < entry.size
             or st.st_mtime_ns < entry.mtime_ns
+            or (st.st_mtime_ns > entry.mtime_ns and st.st_size == entry.size)
         )
 
         if needs_full_read:
@@ -593,6 +603,7 @@ def load_messages_incremental(path: Path) -> list[Message]:
             _INCR_CACHE[key] = entry
             start_offset = 0
         elif st.st_size == entry.size and st.st_mtime_ns == entry.mtime_ns:
+            _INCR_CACHE.move_to_end(key)
             return list(entry.messages)
         else:
             start_offset = entry.offset
@@ -606,6 +617,7 @@ def load_messages_incremental(path: Path) -> list[Message]:
         last_newline = raw_bytes.rfind(b"\n")
         if last_newline == -1:
             # No complete lines in the new region yet; leave cache untouched.
+            _INCR_CACHE.move_to_end(key)
             return list(entry.messages)
 
         complete = raw_bytes[: last_newline + 1]
@@ -627,6 +639,10 @@ def load_messages_incremental(path: Path) -> list[Message]:
             # Retain the newest MAX_CACHED_MESSAGES; byte-offset tracking is
             # independent of what we hold in memory.
             del entry.messages[:-MAX_CACHED_MESSAGES]
+
+        _INCR_CACHE.move_to_end(key)
+        while len(_INCR_CACHE) > MAX_CACHE_SESSIONS:
+            _INCR_CACHE.popitem(last=False)
 
         return list(entry.messages)
 

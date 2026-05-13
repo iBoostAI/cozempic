@@ -385,3 +385,150 @@ class TestPolishV3_ClaudeProcessMtimeFallback(unittest.TestCase):
                 result,
                 "aged JSONL mtime must NOT corroborate — Claude is dead",
             )
+
+
+# ─── R1-FIX F1 — same-size in-place rewrite must invalidate cache ───────────
+
+
+class TestR1_F1_SameSizeRewriteInvalidation(unittest.TestCase):
+    """Adversarial R1 F1: an in-place rewrite via `open('r+')` preserves inode
+    and size while advancing mtime. The original inode/size/mtime_ns predicate
+    missed this case and returned stale cached content, violating the audit §3
+    equivalence contract.
+
+    Fix contract: mtime advancing with size unchanged is itself a cache-miss
+    signal — full re-read required.
+    """
+
+    def test_in_place_same_size_rewrite_returns_fresh_content(self):
+        from cozempic.session import (
+            _INCR_CACHE,
+            load_messages,
+            load_messages_incremental,
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            _INCR_CACHE.clear()
+            p = Path(tmp) / "s.jsonl"
+            p.write_text('{"a":1}\n{"a":2}\n{"a":3}\n')
+            r1 = load_messages_incremental(p)
+            self.assertEqual(len(r1), 3)
+
+            # Ensure the subsequent write lands with an advancing mtime.
+            time.sleep(0.01)
+            # r+ preserves inode; exactly matching byte count keeps size identical.
+            with open(p, "r+", encoding="utf-8") as f:
+                f.write('{"z":9}\n{"z":8}\n{"z":7}\n')
+
+            r2 = load_messages_incremental(p)
+            self.assertEqual(
+                r2, load_messages(p),
+                "cache must invalidate on mtime advance with unchanged size",
+            )
+
+
+# ─── R1-FIX F2 — _INCR_CACHE LRU bound across sessions ──────────────────────
+
+
+class TestR1_F2_CacheLRUAcrossSessions(unittest.TestCase):
+    """Adversarial R1 F2: _INCR_CACHE accreted one entry per distinct Path,
+    unbounded. Single-session guard is fine, but library-API consumers
+    (find_sessions() → loop) leaked.
+
+    Fix contract: cap at MAX_CACHE_SESSIONS with LRU eviction.
+    """
+
+    def test_cache_bounded_by_max_cache_sessions(self):
+        from cozempic.session import (
+            MAX_CACHE_SESSIONS,
+            _INCR_CACHE,
+            load_messages_incremental,
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            _INCR_CACHE.clear()
+            for i in range(MAX_CACHE_SESSIONS + 10):
+                p = Path(tmp) / f"s{i}.jsonl"
+                _write_jsonl(p, n_lines=3, payload_bytes=100)
+                load_messages_incremental(p)
+
+            self.assertLessEqual(
+                len(_INCR_CACHE), MAX_CACHE_SESSIONS,
+                f"cache held {len(_INCR_CACHE)} entries "
+                f"(cap {MAX_CACHE_SESSIONS})",
+            )
+
+    def test_cache_evicts_least_recently_used(self):
+        from cozempic.session import (
+            MAX_CACHE_SESSIONS,
+            _INCR_CACHE,
+            load_messages_incremental,
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            _INCR_CACHE.clear()
+            paths = []
+            for i in range(MAX_CACHE_SESSIONS):
+                p = Path(tmp) / f"s{i}.jsonl"
+                _write_jsonl(p, n_lines=3, payload_bytes=100)
+                load_messages_incremental(p)
+                paths.append(p.resolve())
+
+            # Touch paths[0] so it becomes most-recently-used.
+            load_messages_incremental(paths[0])
+
+            # Insert one more — expect eviction of paths[1] (oldest), NOT paths[0].
+            extra = Path(tmp) / "extra.jsonl"
+            _write_jsonl(extra, n_lines=3, payload_bytes=100)
+            load_messages_incremental(extra)
+
+            self.assertIn(paths[0], _INCR_CACHE, "most-recently-used path was evicted")
+            self.assertNotIn(paths[1], _INCR_CACHE, "least-recently-used path was NOT evicted")
+
+
+# ─── R1-FIX F3 — _terminate_and_resume accepts session_path ──────────────────
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only fallback path")
+class TestR1_F3_TerminateAndResumeAcceptsSessionPath(unittest.TestCase):
+    """Adversarial R1 F3: watchdog passed session_path to _is_claude_process
+    (FIX-L2), but _terminate_and_resume's 8 internal calls did not. Result:
+    watchdog said alive, reload path said dead, reload silently skipped.
+
+    Fix contract: _terminate_and_resume accepts session_path and plumbs it
+    into every _is_claude_process call inside it.
+    """
+
+    def test_terminate_and_resume_signature_accepts_session_path(self):
+        import inspect
+        from cozempic.guard import _terminate_and_resume
+        sig = inspect.signature(_terminate_and_resume)
+        self.assertIn(
+            "session_path", sig.parameters,
+            "_terminate_and_resume must accept session_path to corroborate "
+            "liveness when ps drifts",
+        )
+
+    def test_terminate_and_resume_plumbs_session_path_to_identity_check(self):
+        """Static source contract: every _is_claude_process call inside
+        _terminate_and_resume MUST carry session_path."""
+        import inspect
+        import re as _re
+        from cozempic.guard import _terminate_and_resume
+        src = inspect.getsource(_terminate_and_resume)
+        # Find every _is_claude_process( ... ) invocation and confirm each
+        # references session_path. Matches across linebreaks.
+        calls = _re.findall(
+            r"_is_claude_process\(([^()]*(?:\([^()]*\)[^()]*)*)\)",
+            src, flags=_re.DOTALL,
+        )
+        self.assertGreater(len(calls), 0, "no identity check found in _terminate_and_resume")
+        missing = [c.strip() for c in calls if "session_path" not in c]
+        self.assertEqual(
+            missing, [],
+            "these _is_claude_process calls in _terminate_and_resume lack "
+            f"session_path: {missing!r}",
+        )

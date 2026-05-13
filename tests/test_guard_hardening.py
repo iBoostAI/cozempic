@@ -964,7 +964,7 @@ class TestNF5_WindowsTaskkillReVerifies(unittest.TestCase):
         # Call sequence: 1st True (outer verify), subsequent False (post-wait)
         call_sequence = [True, False, False, False, False]
 
-        def fake_is_claude_process(pid):
+        def fake_is_claude_process(pid, **kwargs):
             return call_sequence.pop(0) if call_sequence else False
 
         subprocess_calls = []
@@ -1636,7 +1636,7 @@ class TestR3_4_PosixPlainTerminalSigtermHasInnerReverify(unittest.TestCase):
         # Subsequent _is_claude_process calls → False (PID recycled).
         call_sequence = [True, False, False, False, False]
 
-        def fake_is_claude_process(pid):
+        def fake_is_claude_process(pid, **kwargs):
             return call_sequence.pop(0) if call_sequence else False
 
         kill_calls = []

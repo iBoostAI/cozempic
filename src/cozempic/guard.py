@@ -721,7 +721,11 @@ def guard_prune_cycle(
     if auto_reload:
         reload_pid = claude_pid if claude_pid is not None else find_claude_pid()
         if reload_pid:
-            _terminate_and_resume(reload_pid, cwd, session_id=session_id)
+            _terminate_and_resume(
+                reload_pid, cwd,
+                session_id=session_id,
+                session_path=session_path,
+            )
             result["reloading"] = True
         else:
             resume_flag = f"--resume {session_id}" if session_id else "--resume"
@@ -901,13 +905,24 @@ def _wait_for_exit(pid: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | None = None) -> None:
+def _terminate_and_resume(
+    claude_pid: int,
+    project_dir: str,
+    session_id: str | None = None,
+    session_path: Path | None = None,
+) -> None:
     """Gracefully exit Claude and resume in the same terminal where possible.
 
     Priority:
       1. tmux/screen: send-keys "/exit" → wait → send-keys "claude --resume" (same pane)
       2. Plain terminal: SIGTERM → open new terminal with resume
       3. SSH: skip terminate, print manual instructions
+
+    When session_path is supplied, the ps-based identity check in
+    _is_claude_process falls back to JSONL mtime recency — matching the
+    watchdog's behaviour. Without this, a forked subshell whose argv drops
+    the claude-code marker is recognised as alive by the watchdog but
+    rejected by this function, silently skipping the reload.
     """
     resume_flag = f"--resume {session_id}" if session_id else "--resume"
 
@@ -923,7 +938,7 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
 
     # Verify the PID still belongs to a Claude process before sending any signal.
     # claude_pid is captured at daemon start; it may have been recycled.
-    if not _is_claude_process(claude_pid):
+    if not _is_claude_process(claude_pid, session_path=session_path):
         print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
         return
 
@@ -941,7 +956,7 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
 
         # Wait for Claude to exit
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
@@ -966,7 +981,7 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
         )
 
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
@@ -982,11 +997,11 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     # Plain terminal — SIGTERM + spawn resume watcher
     try:
         if system == "Windows":
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 subprocess.call(["taskkill", "/PID", str(claude_pid)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 os.kill(claude_pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         pass
@@ -994,11 +1009,11 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     if not _wait_for_exit(claude_pid, timeout=5.0):
         try:
             if system == "Windows":
-                if _is_claude_process(claude_pid):
+                if _is_claude_process(claude_pid, session_path=session_path):
                     subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                if _is_claude_process(claude_pid):
+                if _is_claude_process(claude_pid, session_path=session_path):
                     os.kill(claude_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
