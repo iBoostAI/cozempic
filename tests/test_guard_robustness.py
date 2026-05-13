@@ -25,7 +25,7 @@ class TestReloadSelfDaemon(unittest.TestCase):
         from cozempic.guard import reload_self_daemon
         result = reload_self_daemon(
             cwd="/tmp",
-            session_id="absolutely-nonexistent-session-uuid-for-test",
+            session_id="11111111-2222-3333-4444-555555555555",
         )
         self.assertFalse(result["reloaded"])
         self.assertIn("no daemon", result["reason"].lower())
@@ -49,8 +49,12 @@ class TestGuardDaemonPidHandoff(unittest.TestCase):
         from cozempic.guard import start_guard_daemon
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            session_log = Path("/tmp/cozempic_guard_test-session.log")
-            session_pid = Path("/tmp/cozempic_guard_test-session.pid")
+            # Use a valid-shape UUID — start_guard_daemon validates session_id
+            # via _pid_file_for_session (BUG-G13), matching the read-side
+            # contract in _is_guard_running_for_session.
+            uuid = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
+            session_log = Path("/tmp") / f"cozempic_guard_{uuid[:12]}.log"
+            session_pid = Path("/tmp") / f"cozempic_guard_{uuid[:12]}.pid"
             captured = {}
 
             class DummyProc:
@@ -68,7 +72,7 @@ class TestGuardDaemonPidHandoff(unittest.TestCase):
             ):
                 result = start_guard_daemon(
                     cwd=tmpdir,
-                    session_id="test-session",
+                    session_id=uuid,
                     threshold_tokens=123,
                 )
 

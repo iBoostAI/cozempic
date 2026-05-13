@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,19 @@ ADMISSION_THRESHOLD = 0.55  # A-MAC composite score gate
 PRUNE_THRESHOLD = 0.30  # Below this → prune
 PROMOTION_COUNT = 2  # Occurrences needed to promote pending → active (was 3, too high for real usage)
 DECAY_DAYS = 30  # Universal decay period (MemoryArena 2602.16313)
+
+# Opt-in stderr diagnostics for silent _to_prohibition rejections (A2).
+# `_DEBUG` is kept as a module-level attribute for test monkeypatching;
+# `_debug()` also re-reads the env on each call so setting COZEMPIC_DEBUG=1
+# AFTER import (programmatic or shell-inherited mid-run) takes effect.
+# Runs inside hooks (PreCompact, Stop) where unconditional stderr would leak
+# to users — hence env-gated.
+_DEBUG = os.environ.get("COZEMPIC_DEBUG") == "1"
+
+
+def _debug(msg: str) -> None:
+    if _DEBUG or os.environ.get("COZEMPIC_DEBUG") == "1":
+        print(f"[cozempic.digest] {msg}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -93,12 +107,17 @@ class DigestStore:
         return self.strategy_rules
 
     def next_id(self) -> str:
+        # Gap-aware: find the smallest unused Rnnnn slot. Widen from 3 to 4
+        # digits past R999 so the fallback never collides with an existing
+        # 4-digit ID on stores that already contain R1000+.
         existing = {r.id for r in self.all_rules()}
-        for i in range(1, 1000):
-            rid = f"R{i:03d}"
+        for i in range(1, 10_000):
+            rid = f"R{i:03d}" if i < 1000 else f"R{i:04d}"
             if rid not in existing:
                 return rid
-        return f"R{len(self.all_rules()) + 1:03d}"
+        # MAX_ACTIVE_RULES=20 caps real usage far below 9999; reaching this
+        # branch is a corruption signal, not a normal overflow.
+        raise RuntimeError("digest store exhausted R001-R9999 id space")
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +168,12 @@ _ZERO_WIDTH_PREFIX_CHARS = ("​", "‌", "‍", "﻿", "⁠", "‎", "‏")
 # restrict to startswith.
 _UNICODE_TAG_LEAD_CHARS = ("＜", "«", "〈")  # ＜ « 〈
 
+# Slash-command detector: '/' + ASCII letter + identifier chars, terminated by
+# whitespace or end-of-string. Case-insensitive so /Compact, /INIT don't leak
+# (A12). File paths like `/Users/...` don't match because the first token
+# contains another '/'.
+_SLASH_CMD_RE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*(?:\s|$)")
+
 
 def _is_system_noise(text: str) -> bool:
     """Return True if `text` is a Claude Code synthetic/framework turn.
@@ -165,14 +190,19 @@ def _is_system_noise(text: str) -> bool:
     stripped = text.strip().lstrip("".join(_ZERO_WIDTH_PREFIX_CHARS))
     if not stripped:
         return True
-    # Tag-like: any line starting with '<' is either synthetic or XML.
-    if stripped.startswith("<"):
+    # Tag-like: any line starting with '<' OR '/<' is synthetic. The '/<'
+    # form appears in some wrapped emissions where a slash precedes the
+    # tag. File paths like `/Users/...` still pass because they start
+    # with '/' followed by a letter, not '<'.
+    if stripped.startswith("<") or stripped.startswith("/<"):
         return True
     # Unicode tag-bracket lookalikes as LEADING char (A1 — fullwidth ＜, «, 〈).
     if stripped[0] in _UNICODE_TAG_LEAD_CHARS:
         return True
-    # Slash command: '/' + lowercase letter (distinguish from file paths like /Users)
-    if len(stripped) >= 2 and stripped[0] == "/" and stripped[1].islower():
+    # Slash command: '/' + letter + identifier chars terminated by whitespace or
+    # end-of-string (A12 — case-insensitive; file paths /Users/... don't match
+    # because their first token embeds another '/').
+    if _SLASH_CMD_RE.match(stripped):
         return True
     # Known framework markers (substring match).
     for marker in _SYSTEM_NOISE_MARKERS:
@@ -319,9 +349,22 @@ def _to_prohibition(text: str) -> str:
     """
     text = text.strip()
     # Reject structural / oversize input — cannot be a clean correction.
-    if not text or len(text) > 200 or text.count("\n") > 2:
+    # Debug messages emit metadata only (length, newline count, single prefix
+    # char). Never echo raw user text — risk of PII / credentials leaking into
+    # stderr logs when COZEMPIC_DEBUG=1.
+    if not text:
+        return ""
+    if len(text) > 200:
+        _debug(f"_to_prohibition rejected: len={len(text)} > 200 (content redacted)")
+        return ""
+    if text.count("\n") > 2:
+        _debug(
+            f"_to_prohibition rejected: multi-paragraph "
+            f"({text.count(chr(10))} newlines, content redacted)"
+        )
         return ""
     if text[0] in "<-*#`":
+        _debug(f"_to_prohibition rejected: structural-prefix {text[0]!r}")
         return ""
     # Already in prohibition form
     if text.lower().startswith("do not ") or text.lower().startswith("don't "):
@@ -345,7 +388,16 @@ def _to_prohibition(text: str) -> str:
         if rest:
             return rest[0].upper() + rest[1:]
 
-    # Default: prefix with "Do not"
+    # Default: prefix with "Do not". Require a letter lead so the grammar is
+    # valid — digit/punctuation prefixes produce malformed prohibitions like
+    # "Do not 5xx errors..." which no model can usefully follow. The
+    # `isalpha()` gate applies regardless of length, so short digit-led text
+    # ("5xx", "1st") is also rejected rather than returning raw. Existing
+    # digit-prefixed active rules auto-demote via the load_digest_store
+    # migration path which re-runs _to_prohibition on rule.evidence.
+    if not text[0].isalpha():
+        _debug(f"_to_prohibition rejected: non-letter lead {text[0]!r}")
+        return ""
     if len(text) > 5:
         return f"Do not {text[0].lower()}{text[1:]}"
     return text
@@ -769,8 +821,18 @@ def update_digest(
         else:
             rejected += 1
 
-    if added > 0 or upvoted > 0:
+    # Persist unconditionally: `store.session_id` is mutated above regardless
+    # of the admission outcome, and `updated` timestamp must advance even on
+    # rejected-only or zero-candidate runs so downstream consumers can
+    # distinguish stale from fresh state. `save_digest_store` is atomic
+    # (tmp+fsync+rename) and concurrent-merge-safe.
+    # A readonly digest dir (Docker --read-only, hardened systemd, NFS quota
+    # hit) must not crash the hook. Degrade to in-memory only; disk catches
+    # up on the next call when the FS recovers.
+    try:
         save_digest_store(store)
+    except (OSError, PermissionError) as e:
+        _debug(f"save_digest_store failed (non-fatal): {type(e).__name__}")
 
     return added, upvoted, rejected
 

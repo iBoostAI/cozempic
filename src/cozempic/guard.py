@@ -1066,9 +1066,35 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
     )
 
 
+# UUID-shape / hex-only guard for session_id inputs to pidfile path composition.
+# 12+ chars keeps the `[:12]` truncation meaningful; the hex+dash character
+# class rejects path-traversal sequences and any non-UUID identifier. Require
+# a hex digit as the first char so pure-dash / leading-dash inputs reject —
+# real UUIDs always start with a hex digit.
+# Note: `_pid_file_for_session` lowercases session_id BEFORE matching, so the
+# regex intentionally accepts lowercase hex only (not an RFC-4122 uppercase bug).
+_SESSION_ID_RE = re.compile(r"^[0-9a-f][0-9a-f-]{11,}$")
+
+
 def _pid_file_for_session(session_id: str) -> Path:
-    """Return the PID file path for a guard daemon watching a specific session."""
-    session_id = _normalize_session_id(session_id)
+    """Return the PID file path for a guard daemon watching a specific session.
+
+    Validates `session_id` against a UUID-shaped regex (hex chars + dashes,
+    length >= 12) so that path-traversal sequences or stray filename tokens
+    cannot escape `/tmp/cozempic_guard_*.pid` namespace.
+    Normalizes to lowercase BEFORE truncation so different-case variants of
+    the same UUID map to the same pidfile (prevents split-brain spawning).
+    Raises ValueError on malformed input so callers fail fast; library-API
+    callers like `_is_guard_running_for_session` catch and return None
+    (treat invalid session as "no daemon"). Error message logs only type
+    and length — never raw content — to avoid PII leaks.
+    """
+    session_id = _normalize_session_id(session_id).lower()
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(
+            f"session_id must be a hex/UUID identifier (>=12 chars), "
+            f"got {type(session_id).__name__} of length {len(session_id)}"
+        )
     return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
 
 
@@ -1102,9 +1128,18 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     """Check if a guard daemon is already running for this specific session.
 
     Returns the PID if running, None otherwise.
+
+    An invalid `session_id` (non-UUID) is treated as "no daemon" (None)
+    rather than raising — library-API safety. Callers outside the CLI
+    (hooks, pytest, third-party integrations) should get a safe default
+    instead of a ValueError propagating up from `_pid_file_for_session`.
     """
     norm_sid = _normalize_session_id(session_id)
-    pid_path = _pid_file_for_session(session_id)
+    try:
+        pid_path = _pid_file_for_session(session_id)
+    except ValueError:
+        # Invalid session_id shape — no daemon can exist for it.
+        return None
     if not pid_path.exists():
         return None
 
@@ -1138,11 +1173,6 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
 # Backward compat aliases
 def _pid_file(cwd: str) -> Path:
     return _pid_file_for_cwd(cwd)
-
-
-def _is_guard_running(cwd: str) -> int | None:
-    """Legacy check — scans for any guard PID file matching this CWD."""
-    return _is_guard_running_for_session(cwd)  # Won't match, but keeps signature
 
 
 def start_guard_daemon(
@@ -1229,15 +1259,30 @@ def start_guard_daemon(
     if session_id:
         session_id = _normalize_session_id(session_id)
 
-    # Use session_id for PID file if available, fall back to CWD hash
+    # Use session_id for PID file if available, fall back to CWD hash.
+    # Route through `_pid_file_for_session` so the UUID-shape / lowercase /
+    # hex-first-char validation applies at the spawn path too. Without this
+    # the write-side builds a different path than the read-side helper
+    # (`_is_guard_running_for_session`), and the caller's own daemon becomes
+    # an unreachable orphan for non-UUID session ids.
     if session_id:
-        pid_key = session_id[:12]
+        try:
+            pid_path = _pid_file_for_session(session_id)
+        except ValueError as e:
+            return {
+                "started": False,
+                "reason": f"invalid session_id: {e}",
+                "pid": None,
+                "pid_file": None,
+                "log_file": None,
+                "already_running": False,
+            }
+        log_file = pid_path.with_suffix(".log")
     else:
         import hashlib
         pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
-
-    log_file = Path("/tmp") / f"cozempic_guard_{pid_key}.log"
-    pid_path = Path("/tmp") / f"cozempic_guard_{pid_key}.pid"
+        log_file = Path("/tmp") / f"cozempic_guard_{pid_key}.log"
+        pid_path = Path("/tmp") / f"cozempic_guard_{pid_key}.pid"
 
     if claude_pid is None:
         claude_pid = find_claude_pid()
@@ -1553,6 +1598,9 @@ def reload_self_daemon(
 
     session_id = _normalize_session_id(session_id)
 
+    # `_is_guard_running_for_session` catches ValueError from the regex gate
+    # and returns None for invalid session_ids, so subsequent direct calls
+    # to `_pid_file_for_session` below are safe when old_pid is truthy.
     old_pid = _is_guard_running_for_session(session_id)
     if not old_pid:
         return {"reloaded": False, "reason": "no daemon running for session"}
