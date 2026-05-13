@@ -8,6 +8,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -485,6 +487,148 @@ def load_messages(path: Path) -> list[Message]:
             except json.JSONDecodeError:
                 messages.append((i, {"_raw": line, "_parse_error": True}, len(line.encode("utf-8"))))
     return messages
+
+
+# ─── Incremental JSONL read (read-only scan path) ───────────────────────────
+#
+# The guard daemon's main loop checkpoints the session every ~30s by calling
+# load_messages() and scanning the result to extract team state. On a long-
+# running session the full-read pattern produces a large allocation each
+# cycle; even though Python frees the list, libmalloc's LARGE_REUSABLE zone
+# retains the chunks. Over hours this manifests as unbounded RSS growth.
+#
+# load_messages_incremental() keeps a per-path cache of parsed messages and
+# advances by byte offset on subsequent calls. Appends pay only the cost of
+# the newly-written bytes. Rewrites (prune via os.replace, truncation) are
+# detected via (inode, size, mtime_ns) and trigger a full re-read.
+#
+# The function is READ-ONLY — do NOT use it on mutation paths (prune cycles,
+# save roundtrips). Those still need full-read semantics paired with
+# _FileSnapshot for append-aware conflict detection.
+
+MAX_CACHED_MESSAGES = 5000  # per-session cache cap; evicts oldest on overflow
+
+
+@dataclass
+class _CacheEntry:
+    messages: list[Message] = field(default_factory=list)
+    offset: int = 0       # byte position after the last fully-parsed newline
+    mtime_ns: int = 0
+    size: int = 0
+    inode: int = 0
+    next_line_index: int = 0  # running file-line counter for Message tuples
+
+
+_INCR_CACHE: dict[Path, _CacheEntry] = {}
+_INCR_LOCK = threading.Lock()
+
+
+def _parse_jsonl_chunk(
+    chunk: str, start_line_index: int
+) -> tuple[list[Message], int]:
+    """Parse a newline-delimited JSONL chunk. Returns (messages, lines_consumed).
+
+    Empty lines advance the line counter but are not emitted (matches
+    load_messages behaviour). Oversized lines are warned and skipped but
+    still consume a line index.
+    """
+    out: list[Message] = []
+    lines_consumed = 0
+    idx = start_line_index
+    for raw in chunk.splitlines():
+        lines_consumed += 1
+        stripped = raw.strip()
+        current = idx
+        idx += 1
+        if not stripped:
+            continue
+        if len(stripped) > MAX_LINE_BYTES:
+            print(
+                f"  Warning: skipping oversized line {current} ({len(stripped)} bytes)",
+                file=sys.stderr,
+            )
+            continue
+        byte_len = len(stripped.encode("utf-8"))
+        try:
+            msg = json.loads(stripped)
+            out.append((current, msg, byte_len))
+        except json.JSONDecodeError:
+            out.append((current, {"_raw": stripped, "_parse_error": True}, byte_len))
+    return out, lines_consumed
+
+
+def load_messages_incremental(path: Path) -> list[Message]:
+    """Return parsed JSONL messages using a byte-offset cache.
+
+    Equivalent to load_messages() on the happy path: same tuple shape, same
+    ordering, same error handling. Diverges only for files larger than
+    MAX_CACHED_MESSAGES — the cache retains the newest N entries, so the
+    returned list is likewise truncated. Callers that need full historical
+    state (prune, save roundtrip) must use load_messages() instead.
+
+    Invalidation: inode change (os.replace), size shrink (truncation), or
+    mtime regression trigger a full re-read. Partial trailing lines (no
+    terminating newline) are deferred until the write completes.
+
+    Thread-safe via a module-global lock.
+    """
+    key = path.resolve()
+    with _INCR_LOCK:
+        try:
+            st = path.stat()
+        except OSError:
+            _INCR_CACHE.pop(key, None)
+            return []
+
+        entry = _INCR_CACHE.get(key)
+        needs_full_read = (
+            entry is None
+            or st.st_ino != entry.inode
+            or st.st_size < entry.size
+            or st.st_mtime_ns < entry.mtime_ns
+        )
+
+        if needs_full_read:
+            entry = _CacheEntry(inode=st.st_ino)
+            _INCR_CACHE[key] = entry
+            start_offset = 0
+        elif st.st_size == entry.size and st.st_mtime_ns == entry.mtime_ns:
+            return list(entry.messages)
+        else:
+            start_offset = entry.offset
+
+        with open(path, "rb") as f:
+            f.seek(start_offset)
+            raw_bytes = f.read(st.st_size - start_offset)
+
+        # Stop at the last complete line — a trailing partial line means the
+        # writer is mid-append. We'll pick up the remainder on the next call.
+        last_newline = raw_bytes.rfind(b"\n")
+        if last_newline == -1:
+            # No complete lines in the new region yet; leave cache untouched.
+            return list(entry.messages)
+
+        complete = raw_bytes[: last_newline + 1]
+        try:
+            chunk = complete.decode("utf-8")
+        except UnicodeDecodeError:
+            chunk = complete.decode("utf-8", errors="replace")
+
+        new_messages, lines_consumed = _parse_jsonl_chunk(
+            chunk, entry.next_line_index
+        )
+        entry.messages.extend(new_messages)
+        entry.next_line_index += lines_consumed
+        entry.offset = start_offset + (last_newline + 1)
+        entry.size = st.st_size
+        entry.mtime_ns = st.st_mtime_ns
+
+        if len(entry.messages) > MAX_CACHED_MESSAGES:
+            # Retain the newest MAX_CACHED_MESSAGES; byte-offset tracking is
+            # independent of what we hold in memory.
+            del entry.messages[:-MAX_CACHED_MESSAGES]
+
+        return list(entry.messages)
 
 
 def save_messages(

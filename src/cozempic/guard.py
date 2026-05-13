@@ -46,6 +46,7 @@ from .session import (
     find_current_session,
     find_sessions,
     load_messages,
+    load_messages_incremental,
     save_messages,
     snapshot_session,
 )
@@ -125,7 +126,9 @@ def checkpoint_team(
             return None
         session_path = sess["path"]
 
-    messages = load_messages(session_path)
+    # Scan-only hot path — use incremental loader to avoid unbounded RSS growth
+    # from repeated full-file reads in the guard's 30s main loop.
+    messages = load_messages_incremental(session_path)
     state = extract_team_state(messages)
 
     if state.is_empty():
