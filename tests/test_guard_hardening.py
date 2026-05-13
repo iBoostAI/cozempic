@@ -17,6 +17,7 @@ Bugs covered:
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -761,20 +762,22 @@ class TestNF2_MainWatchdogUsesIdentityCheck(unittest.TestCase):
     The loop still only calls `os.kill(claude_pid, 0)` — PID-reuse bug unfixed.
     """
 
+    # Matches _is_claude_process(claude_pid) or _is_claude_process(claude_pid, ...)
+    _IDENTITY_CALL_RE = re.compile(r"_is_claude_process\(\s*claude_pid\b")
+
     def test_watchdog_source_invokes_identity_check(self):
         """Static source contract: start_guard's watchdog section MUST call
-        `_is_claude_process(claude_pid)` — otherwise PID-reuse races through
-        liveness-only `os.kill(pid, 0)`."""
+        `_is_claude_process(claude_pid, ...)` — otherwise PID-reuse races
+        through liveness-only `os.kill(pid, 0)`."""
         import inspect
         from cozempic.guard import start_guard
         src = inspect.getsource(start_guard)
-        has_identity_call = "_is_claude_process(claude_pid)" in src
         self.assertTrue(
-            has_identity_call,
+            self._IDENTITY_CALL_RE.search(src),
             "Main-loop watchdog (guard.py:~414) does not call "
-            "_is_claude_process(claude_pid). BUG-G8 fix added the helper but "
-            "did not wire it into the watchdog — recycled-PID still races "
-            "through `os.kill(pid, 0)` alone.",
+            "_is_claude_process(claude_pid, ...). BUG-G8 fix added the helper "
+            "but did not wire it into the watchdog — recycled-PID still "
+            "races through `os.kill(pid, 0)` alone.",
         )
 
     def test_watchdog_flips_claude_alive_on_identity_fail(self):
@@ -784,12 +787,13 @@ class TestNF2_MainWatchdogUsesIdentityCheck(unittest.TestCase):
         import inspect
         from cozempic.guard import start_guard
         src = inspect.getsource(start_guard)
-        if "_is_claude_process(claude_pid)" not in src:
+        m = self._IDENTITY_CALL_RE.search(src)
+        if not m:
             self.fail(
                 "Watchdog has no identity call at all (see sibling test). "
                 "NF-2: main watchdog still uses liveness-only os.kill(pid, 0)."
             )
-        idx = src.index("_is_claude_process(claude_pid)")
+        idx = m.start()
         window = src[max(0, idx - 100):idx + 400]
         self.assertIn(
             "claude_alive", window,

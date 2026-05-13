@@ -432,7 +432,7 @@ def start_guard(
                     # PID reuse (daemon started hours ago; original Claude exited and
                     # kernel recycled its PID to an unrelated process).
                     try:
-                        if not _is_claude_process(claude_pid):
+                        if not _is_claude_process(claude_pid, session_path=session_path):
                             claude_alive = False
                     except ProcessLookupError:
                         claude_alive = False
@@ -1493,12 +1493,21 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         return False
 
 
-def _is_claude_process(pid: int) -> bool:
+_MTIME_LIVENESS_WINDOW_SEC = 60
+
+
+def _is_claude_process(pid: int, session_path: Path | None = None) -> bool:
     """Verify that `pid` is a Claude Code process (node/claude binary).
 
     Mirrors _is_cozempic_guard_process but for the Claude client side.
     Guards against PID reuse: if Claude exits and its PID is recycled, a blind
     SIGTERM on the recycled PID is a confused-deputy bug.
+
+    When `session_path` is provided and the ps-based check is inconclusive,
+    falls back to JSONL-mtime corroboration: a file written within the last
+    minute means Claude is almost certainly still alive, even if ps misses
+    the match (observed on macOS when Claude forks a subshell whose args
+    don't carry the claude-code marker).
 
     On Windows, `ps` is unavailable — uses `tasklist /FI "PID eq <pid>" /FO CSV`
     instead. If tasklist also fails, falls back to liveness-only (returns True
@@ -1511,27 +1520,35 @@ def _is_claude_process(pid: int) -> bool:
             ["ps", "-p", str(pid), "-o", "args="],
             capture_output=True, text=True, timeout=3, check=False,
         )
-        if result.returncode != 0:
-            return False
-        args = (result.stdout or "").strip()
-        tokens = args.split()
-        if not tokens:
-            return False
-        binary = Path(tokens[0]).name.lower()
-        # Match native claude binary (whole name, not substring)
-        if binary == "claude":
-            return True
-        # Match node-based Claude Code: binary must be exactly "node" or "node.js"
-        # AND args must contain a Claude Code-specific marker.
-        if binary in ("node", "node.js"):
-            if "@anthropic-ai/claude-code" in args:
-                return True
-            # cli.js under a claude-code directory
-            if "claude-code/cli.js" in args or "claude-code\\cli.js" in args:
-                return True
-        return False
+        if result.returncode == 0:
+            args = (result.stdout or "").strip()
+            tokens = args.split()
+            if tokens:
+                binary = Path(tokens[0]).name.lower()
+                # Match native claude binary (whole name, not substring)
+                if binary == "claude":
+                    return True
+                # Match node-based Claude Code: binary must be exactly "node"
+                # or "node.js" AND args must contain a Claude Code marker.
+                if binary in ("node", "node.js"):
+                    if "@anthropic-ai/claude-code" in args:
+                        return True
+                    if "claude-code/cli.js" in args or "claude-code\\cli.js" in args:
+                        return True
     except (subprocess.SubprocessError, OSError):
-        return False
+        pass
+
+    # ps was inconclusive (no match, or subprocess error). If we have a
+    # session path and its JSONL was touched very recently, take that as
+    # corroboration: the Claude daemon is the only writer on that file.
+    if session_path is not None:
+        try:
+            age = time.time() - session_path.stat().st_mtime
+            if age < _MTIME_LIVENESS_WINDOW_SEC:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def _is_claude_process_windows(pid: int) -> bool:
