@@ -1,16 +1,16 @@
 # Cozempic
 
-![Downloads](https://img.shields.io/badge/downloads-35k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.10-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![Downloads](https://img.shields.io/badge/downloads-50k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.10-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-**35,000+ power users** trust Cozempic to keep their Claude Code sessions lean.
+**50,000+ power users** trust Cozempic to keep their Claude Code sessions lean.
 
-Context cleaning for [Claude Code](https://claude.ai/code) ��� **remove the bloat, keep everything that matters, protect Agent Teams from context loss**.
+Context cleaning for [Claude Code](https://claude.ai/code) — **remove the bloat, keep everything that matters, protect Agent Teams from context loss**.
 
 ## What It Does
 
 Claude Code sessions fill up with dead weight: progress ticks, thinking blocks, stale file reads, duplicate CLAUDE.md injections, base64 screenshots, oversized tool outputs, and metadata bloat. A typical session carries 8-46MB — most of it noise that inflates every API call.
 
-Cozempic removes it with **17 composable strategies** across 3 prescription tiers, while your actual conversation, decisions, and working context stay untouched. The guard daemon runs automatically — install once, forget about it.
+Cozempic removes it with **18 composable strategies** across 3 prescription tiers, while your actual conversation, decisions, and working context stay untouched. The guard daemon runs automatically — install once, forget about it.
 
 ### Key Features
 
@@ -19,7 +19,7 @@ Cozempic removes it with **17 composable strategies** across 3 prescription tier
 - **compact-summary-collapse** — 85-95% savings by removing pre-compaction messages already in the summary
 - **Agent Teams protection** — checkpoints team state through compaction, reactive overflow recovery
 - **Behavioral digest** — extracts your corrections ("don't do X"), persists them to Claude Code's memory system so they survive compaction
-- **8 doctor checks** — diagnose and auto-fix session corruption, orphaned tool results, zombie teams
+- **13 doctor checks** — diagnose and auto-fix session corruption, orphaned tool results, zombie teams
 - **Token-aware diagnostics** — exact token counts from `usage` fields, cache hit rate, context % bar
 - **Auto-detects 1M context** — correct thresholds for both 200K and 1M models
 - **Auto-updates** — checks PyPI daily, upgrades in-place
