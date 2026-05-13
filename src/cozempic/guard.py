@@ -488,6 +488,7 @@ def start_guard(
                     auto_reload=auto_reload,
                     cwd=cwd or os.getcwd(),
                     session_id=sess["session_id"],
+                    claude_pid=claude_pid,
                 )
 
                 if result.get("reloading"):
@@ -534,6 +535,7 @@ def start_guard(
                         auto_reload=auto_reload,
                         cwd=cwd or os.getcwd(),
                         session_id=sess["session_id"],
+                        claude_pid=claude_pid,
                     )
 
                 if result.get("reloading"):
