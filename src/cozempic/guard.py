@@ -46,6 +46,7 @@ from .session import (
     find_current_session,
     find_sessions,
     load_messages,
+    load_messages_incremental,
     save_messages,
     snapshot_session,
 )
@@ -125,7 +126,9 @@ def checkpoint_team(
             return None
         session_path = sess["path"]
 
-    messages = load_messages(session_path)
+    # Scan-only hot path — use incremental loader to avoid unbounded RSS growth
+    # from repeated full-file reads in the guard's 30s main loop.
+    messages = load_messages_incremental(session_path)
     state = extract_team_state(messages)
 
     if state.is_empty():
@@ -429,7 +432,7 @@ def start_guard(
                     # PID reuse (daemon started hours ago; original Claude exited and
                     # kernel recycled its PID to an unrelated process).
                     try:
-                        if not _is_claude_process(claude_pid):
+                        if not _is_claude_process(claude_pid, session_path=session_path):
                             claude_alive = False
                     except ProcessLookupError:
                         claude_alive = False
@@ -718,7 +721,11 @@ def guard_prune_cycle(
     if auto_reload:
         reload_pid = claude_pid if claude_pid is not None else find_claude_pid()
         if reload_pid:
-            _terminate_and_resume(reload_pid, cwd, session_id=session_id)
+            _terminate_and_resume(
+                reload_pid, cwd,
+                session_id=session_id,
+                session_path=session_path,
+            )
             result["reloading"] = True
         else:
             resume_flag = f"--resume {session_id}" if session_id else "--resume"
@@ -898,13 +905,24 @@ def _wait_for_exit(pid: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | None = None) -> None:
+def _terminate_and_resume(
+    claude_pid: int,
+    project_dir: str,
+    session_id: str | None = None,
+    session_path: Path | None = None,
+) -> None:
     """Gracefully exit Claude and resume in the same terminal where possible.
 
     Priority:
       1. tmux/screen: send-keys "/exit" → wait → send-keys "claude --resume" (same pane)
       2. Plain terminal: SIGTERM → open new terminal with resume
       3. SSH: skip terminate, print manual instructions
+
+    When session_path is supplied, the ps-based identity check in
+    _is_claude_process falls back to JSONL mtime recency — matching the
+    watchdog's behaviour. Without this, a forked subshell whose argv drops
+    the claude-code marker is recognised as alive by the watchdog but
+    rejected by this function, silently skipping the reload.
     """
     resume_flag = f"--resume {session_id}" if session_id else "--resume"
 
@@ -920,7 +938,7 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
 
     # Verify the PID still belongs to a Claude process before sending any signal.
     # claude_pid is captured at daemon start; it may have been recycled.
-    if not _is_claude_process(claude_pid):
+    if not _is_claude_process(claude_pid, session_path=session_path):
         print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
         return
 
@@ -938,7 +956,7 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
 
         # Wait for Claude to exit
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
@@ -963,7 +981,7 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
         )
 
         if not _wait_for_exit(claude_pid, timeout=10.0):
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 os.kill(claude_pid, signal.SIGTERM)
             _wait_for_exit(claude_pid, timeout=5.0)
 
@@ -979,11 +997,11 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     # Plain terminal — SIGTERM + spawn resume watcher
     try:
         if system == "Windows":
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 subprocess.call(["taskkill", "/PID", str(claude_pid)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            if _is_claude_process(claude_pid):
+            if _is_claude_process(claude_pid, session_path=session_path):
                 os.kill(claude_pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         pass
@@ -991,11 +1009,11 @@ def _terminate_and_resume(claude_pid: int, project_dir: str, session_id: str | N
     if not _wait_for_exit(claude_pid, timeout=5.0):
         try:
             if system == "Windows":
-                if _is_claude_process(claude_pid):
+                if _is_claude_process(claude_pid, session_path=session_path):
                     subprocess.call(["taskkill", "/F", "/PID", str(claude_pid)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                if _is_claude_process(claude_pid):
+                if _is_claude_process(claude_pid, session_path=session_path):
                     os.kill(claude_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
@@ -1490,12 +1508,21 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         return False
 
 
-def _is_claude_process(pid: int) -> bool:
+_MTIME_LIVENESS_WINDOW_SEC = 60
+
+
+def _is_claude_process(pid: int, session_path: Path | None = None) -> bool:
     """Verify that `pid` is a Claude Code process (node/claude binary).
 
     Mirrors _is_cozempic_guard_process but for the Claude client side.
     Guards against PID reuse: if Claude exits and its PID is recycled, a blind
     SIGTERM on the recycled PID is a confused-deputy bug.
+
+    When `session_path` is provided and the ps-based check is inconclusive,
+    falls back to JSONL-mtime corroboration: a file written within the last
+    minute means Claude is almost certainly still alive, even if ps misses
+    the match (observed on macOS when Claude forks a subshell whose args
+    don't carry the claude-code marker).
 
     On Windows, `ps` is unavailable — uses `tasklist /FI "PID eq <pid>" /FO CSV`
     instead. If tasklist also fails, falls back to liveness-only (returns True
@@ -1508,27 +1535,35 @@ def _is_claude_process(pid: int) -> bool:
             ["ps", "-p", str(pid), "-o", "args="],
             capture_output=True, text=True, timeout=3, check=False,
         )
-        if result.returncode != 0:
-            return False
-        args = (result.stdout or "").strip()
-        tokens = args.split()
-        if not tokens:
-            return False
-        binary = Path(tokens[0]).name.lower()
-        # Match native claude binary (whole name, not substring)
-        if binary == "claude":
-            return True
-        # Match node-based Claude Code: binary must be exactly "node" or "node.js"
-        # AND args must contain a Claude Code-specific marker.
-        if binary in ("node", "node.js"):
-            if "@anthropic-ai/claude-code" in args:
-                return True
-            # cli.js under a claude-code directory
-            if "claude-code/cli.js" in args or "claude-code\\cli.js" in args:
-                return True
-        return False
+        if result.returncode == 0:
+            args = (result.stdout or "").strip()
+            tokens = args.split()
+            if tokens:
+                binary = Path(tokens[0]).name.lower()
+                # Match native claude binary (whole name, not substring)
+                if binary == "claude":
+                    return True
+                # Match node-based Claude Code: binary must be exactly "node"
+                # or "node.js" AND args must contain a Claude Code marker.
+                if binary in ("node", "node.js"):
+                    if "@anthropic-ai/claude-code" in args:
+                        return True
+                    if "claude-code/cli.js" in args or "claude-code\\cli.js" in args:
+                        return True
     except (subprocess.SubprocessError, OSError):
-        return False
+        pass
+
+    # ps was inconclusive (no match, or subprocess error). If we have a
+    # session path and its JSONL was touched very recently, take that as
+    # corroboration: the Claude daemon is the only writer on that file.
+    if session_path is not None:
+        try:
+            age = time.time() - session_path.stat().st_mtime
+            if age < _MTIME_LIVENESS_WINDOW_SEC:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def _is_claude_process_windows(pid: int) -> bool:
