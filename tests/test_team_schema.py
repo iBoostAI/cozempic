@@ -6,10 +6,12 @@ import json
 import unittest
 
 from cozempic.team import (
+    TaskInfo,
     TeamState,
     _is_team_message,
     _is_task_tool_result,
     extract_team_state,
+    inject_team_recovery,
     merge_config_into_state,
 )
 
@@ -140,6 +142,57 @@ class TestMergeConfigStrongJoin(unittest.TestCase):
         state = self._state(team_name="Existing")
         result = merge_config_into_state(state, [])
         self.assertEqual(result.team_name, "Existing")
+
+
+class TestTeamRecoveryRendering(unittest.TestCase):
+
+    def _mixed_task_state(self):
+        return TeamState(tasks=[
+            TaskInfo("1", "Ship current fix", "pending"),
+            TaskInfo("2", "Review tests", "in_progress", owner="dev"),
+            TaskInfo("3", "Old completed task", "completed"),
+            TaskInfo("4", "", "completed"),
+        ])
+
+    def test_recovery_text_lists_active_tasks_and_summarizes_omitted(self):
+        text = self._mixed_task_state().to_recovery_text()
+
+        self.assertIn("Shared active tasks:", text)
+        self.assertIn("[PENDING] Ship current fix", text)
+        self.assertIn("[IN_PROGRESS] Review tests (owner: dev)", text)
+        self.assertIn("1 completed, 1 blank", text)
+        self.assertNotIn("Old completed task", text)
+
+    def test_checkpoint_markdown_lists_active_tasks_and_summarizes_omitted(self):
+        text = self._mixed_task_state().to_markdown()
+
+        self.assertIn("## Active Task List", text)
+        self.assertIn("- [ ] Ship current fix", text)
+        self.assertIn("- [/] Review tests @dev", text)
+        self.assertIn("1 completed, 1 blank", text)
+        self.assertNotIn("Old completed task", text)
+
+    def test_inject_team_recovery_skips_completed_only_tasks(self):
+        messages = [(0, {"uuid": "root", "message": {"role": "assistant", "content": []}}, 1)]
+        state = TeamState(tasks=[
+            TaskInfo("1", "Already finished", "completed"),
+            TaskInfo("2", "", "completed"),
+        ])
+
+        self.assertEqual(inject_team_recovery(messages, state), messages)
+
+    def test_inject_team_recovery_deduplicates_same_recovery_block(self):
+        messages = [(0, {"uuid": "root", "message": {"role": "assistant", "content": []}}, 1)]
+        state = TeamState(tasks=[
+            TaskInfo("1", "Ship current fix", "pending"),
+            TaskInfo("2", "Already finished", "completed"),
+        ])
+
+        once = inject_team_recovery(messages, state)
+        twice = inject_team_recovery(once, state)
+
+        self.assertEqual(len(once), 3)
+        self.assertEqual(len(twice), 3)
 
 
 class TestExtractTeamState(unittest.TestCase):

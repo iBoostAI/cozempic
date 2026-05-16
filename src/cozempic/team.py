@@ -80,6 +80,23 @@ class TeamState:
             and not self.tasks
         )
 
+    def _task_groups(self) -> tuple[list[TaskInfo], int, int]:
+        """Split tasks into active work and low-value completed/blank noise."""
+        active: list[TaskInfo] = []
+        completed = 0
+        blank = 0
+        inactive_statuses = {"completed", "done", "cancelled", "canceled"}
+        for task in self.tasks:
+            subject = (task.subject or "").strip()
+            if not subject:
+                blank += 1
+                continue
+            if (task.status or "").strip().lower() in inactive_statuses:
+                completed += 1
+                continue
+            active.append(task)
+        return active, completed, blank
+
     def to_markdown(self) -> str:
         """Render team state as markdown for checkpoint file."""
         lines = []
@@ -116,14 +133,26 @@ class TeamState:
             lines.append("")
 
         if self.tasks:
-            lines.append("## Task List")
+            active_tasks, completed_count, blank_count = self._task_groups()
+            lines.append("## Active Task List")
             status_icons = {"completed": "x", "in_progress": "/", "pending": " "}
-            for t in self.tasks:
-                icon = status_icons.get(t.status, " ")
-                owner = f" @{t.owner}" if t.owner else ""
-                lines.append(f"- [{icon}] {t.subject}{owner}")
-                if t.description:
-                    lines.append(f"  {t.description[:200]}")
+            if active_tasks:
+                for t in active_tasks:
+                    icon = status_icons.get(t.status, " ")
+                    owner = f" @{t.owner}" if t.owner else ""
+                    lines.append(f"- [{icon}] {t.subject}{owner}")
+                    if t.description:
+                        lines.append(f"  {t.description[:200]}")
+            else:
+                lines.append("- No active tasks.")
+            omitted = completed_count + blank_count
+            if omitted:
+                detail = []
+                if completed_count:
+                    detail.append(f"{completed_count} completed")
+                if blank_count:
+                    detail.append(f"{blank_count} blank")
+                lines.append(f"_Omitted {', '.join(detail)} task(s) from recovery context._")
             lines.append("")
 
         if self.lead_summary:
@@ -159,10 +188,25 @@ class TeamState:
                     parts.append(f"    Result: {s.result_summary[:150]}")
 
         if self.tasks:
-            parts.append("\nShared task list:")
-            for t in self.tasks:
-                owner = f" (owner: {t.owner})" if t.owner else ""
-                parts.append(f"  - [{t.status.upper()}] {t.subject}{owner}")
+            active_tasks, completed_count, blank_count = self._task_groups()
+            if active_tasks:
+                parts.append("\nShared active tasks:")
+                shown_tasks = active_tasks[:10]
+                for t in shown_tasks:
+                    owner = f" (owner: {t.owner})" if t.owner else ""
+                    parts.append(f"  - [{t.status.upper()}] {t.subject}{owner}")
+                if len(active_tasks) > len(shown_tasks):
+                    parts.append(f"  - ... {len(active_tasks) - len(shown_tasks)} more active task(s) omitted")
+            else:
+                parts.append("\nShared task list: no active tasks.")
+            omitted = completed_count + blank_count
+            if omitted:
+                detail = []
+                if completed_count:
+                    detail.append(f"{completed_count} completed")
+                if blank_count:
+                    detail.append(f"{blank_count} blank")
+                parts.append(f"Completed/empty tasks omitted from recovery context: {', '.join(detail)}.")
 
         if self.lead_summary:
             parts.append(f"\nCoordination context: {self.lead_summary}")
@@ -699,7 +743,28 @@ def inject_team_recovery(messages: list[Message], state: TeamState) -> list[Mess
     user_uuid = str(uuid_mod.uuid4())
     assistant_uuid = str(uuid_mod.uuid4())
 
+    active_tasks, completed_tasks, blank_tasks = state._task_groups()
+    has_actionable_context = bool(
+        state.teammates
+        or state.subagents
+        or active_tasks
+        or state.lead_agent_id
+        or (state.team_name and state.team_name != "unnamed")
+    )
+    if not has_actionable_context:
+        return messages
+
     recovery_text = state.to_recovery_text()
+    for _, msg, _ in reversed(messages[-80:]):
+        inner = msg.get("message", {})
+        content = inner.get("content", "")
+        if (
+            isinstance(content, str)
+            and "[Cozempic Guard: context was pruned." in content
+            and recovery_text in content
+        ):
+            return messages
+
     checkpoint_note = (
         "A team state checkpoint was also written to .claude/team-checkpoint.md."
     )
@@ -713,11 +778,14 @@ def inject_team_recovery(messages: list[Message], state: TeamState) -> list[Mess
     if state.subagents:
         summary_bits.append(f"{len(state.subagents)} subagent(s)")
     if state.tasks:
-        pending = sum(1 for t in state.tasks if t.status.lower() == "pending")
-        in_progress = sum(1 for t in state.tasks if t.status.lower() == "in_progress")
-        task_bit = f"{len(state.tasks)} task(s)"
+        pending = sum(1 for t in active_tasks if t.status.lower() == "pending")
+        in_progress = sum(1 for t in active_tasks if t.status.lower() == "in_progress")
+        task_bit = f"{len(active_tasks)} active task(s)"
+        omitted = completed_tasks + blank_tasks
         if pending or in_progress:
             task_bit += f" ({pending} pending, {in_progress} in progress)"
+        if omitted:
+            task_bit += f", {omitted} omitted"
         summary_bits.append(task_bit)
     summary = ", ".join(summary_bits) if summary_bits else "state restored"
 
