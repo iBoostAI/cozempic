@@ -39,7 +39,7 @@ def _c(args: str) -> str:
 # at the end of every canonical hook command (e.g. "# cozempic-hook-schema=v2")
 # is what `_is_current_cozempic_hook` looks for — old hooks without the current
 # marker are treated as stale and get refreshed on next init.
-HOOK_SCHEMA_VERSION = "v5"
+HOOK_SCHEMA_VERSION = "v6"
 HOOK_SCHEMA_MARKER = f"cozempic-hook-schema={HOOK_SCHEMA_VERSION}"
 
 

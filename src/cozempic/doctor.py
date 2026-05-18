@@ -515,9 +515,12 @@ def fix_corrupted_tool_use() -> str:
     import re
     import shutil
 
+    from .session import _PruneLock, PruneLockError
+
     sessions = find_sessions()
     total_fixed = 0
     sessions_fixed = 0
+    skipped_sessions = []
 
     for sess in sessions:
         path = sess["path"]
@@ -526,6 +529,16 @@ def fix_corrupted_tool_use() -> str:
             if count == 0:
                 continue
         except (OSError, UnicodeDecodeError):
+            continue
+
+        # Acquire the per-session prune lock so we don't race the guard
+        # daemon's prune cycle (which would overwrite our fix mid-write).
+        # If guard is actively pruning, skip — user can re-run doctor later.
+        try:
+            _prune_lock_ctx = _PruneLock(path)
+            _prune_lock_ctx.__enter__()
+        except PruneLockError:
+            skipped_sessions.append(sess["session_id"])
             continue
 
         # Backup before modifying
@@ -581,22 +594,33 @@ def fix_corrupted_tool_use() -> str:
             if changed:
                 lines[idx] = json.dumps(obj, ensure_ascii=False) + "\n"
 
-        if fixed_in_session > 0:
-            content = "".join(lines)
-            tmp_path = path.with_suffix(".tmp")
+        try:
+            if fixed_in_session > 0:
+                # Atomic write via mkstemp — collision-safe if a parallel
+                # writer (shouldn't happen since we hold _PruneLock, but
+                # belt-and-suspenders) targets the same session.
+                from .helpers import atomic_write_text
+                atomic_write_text(path, "".join(lines))
+                total_fixed += fixed_in_session
+                sessions_fixed += 1
+        finally:
             try:
-                tmp_path.write_text(content, encoding="utf-8")
-                import os as _os
-                _os.replace(tmp_path, path)
+                _prune_lock_ctx.__exit__(None, None, None)
             except Exception:
-                tmp_path.unlink(missing_ok=True)
-                raise
-            total_fixed += fixed_in_session
-            sessions_fixed += 1
+                pass
 
+    skipped_note = ""
+    if skipped_sessions:
+        skipped_note = (
+            f" Skipped {len(skipped_sessions)} session(s) with active guard cycles "
+            f"(re-run after guard is idle)."
+        )
     if total_fixed == 0:
-        return "No corrupted tool_use blocks found."
-    return f"Repaired {total_fixed} tool_use block(s) in {sessions_fixed} session(s). Backups created."
+        return f"No corrupted tool_use blocks found.{skipped_note}"
+    return (
+        f"Repaired {total_fixed} tool_use block(s) in {sessions_fixed} session(s). "
+        f"Backups created.{skipped_note}"
+    )
 
 
 def check_orphaned_tool_results() -> CheckResult:
@@ -676,12 +700,22 @@ def _count_orphaned_tool_results(path: Path) -> int:
 
 
 def fix_orphaned_tool_results() -> str:
-    """Remove orphaned tool_result blocks from all sessions."""
-    from .session import load_messages, save_messages
+    """Remove orphaned tool_result blocks from all sessions.
+
+    Acquires per-session _PruneLock + passes snapshot to save_messages so we
+    can't race the guard daemon's prune cycle. Sessions with an active guard
+    cycle are skipped (user can re-run after guard is idle) — same protection
+    as fix_corrupted_tool_use.
+    """
+    from .session import (
+        _PruneLock, PruneConflictError, PruneLockError,
+        load_messages, save_messages, snapshot_session,
+    )
 
     sessions = find_sessions()
     total_fixed = 0
     sessions_fixed = 0
+    skipped_sessions = []
 
     for sess in sessions:
         try:
@@ -692,17 +726,40 @@ def fix_orphaned_tool_results() -> str:
             continue
 
         from .executor import fix_orphaned_tool_results as _fix
-        messages = load_messages(sess["path"])
+        path = sess["path"]
+        # Take snapshot BEFORE load_messages so append-conflict detection
+        # in save_messages can correctly identify if Claude wrote new lines
+        # between our load and save.
+        snapshot = snapshot_session(path)
+        messages = load_messages(path)
         fixed_messages, orphans = _fix(messages)
 
         if orphans > 0:
-            save_messages(sess["path"], fixed_messages, create_backup=True)
-            total_fixed += orphans
-            sessions_fixed += 1
+            try:
+                with _PruneLock(path):
+                    save_messages(path, fixed_messages, create_backup=True, snapshot=snapshot)
+                total_fixed += orphans
+                sessions_fixed += 1
+            except PruneLockError:
+                skipped_sessions.append(sess["session_id"])
+                continue
+            except PruneConflictError:
+                # Session changed mid-fix — skip rather than corrupt
+                skipped_sessions.append(sess["session_id"])
+                continue
 
+    skipped_note = ""
+    if skipped_sessions:
+        skipped_note = (
+            f" Skipped {len(skipped_sessions)} session(s) with active guard cycles "
+            f"or concurrent appends (re-run after guard is idle)."
+        )
     if total_fixed == 0:
-        return "No orphaned tool_result blocks found."
-    return f"Removed {total_fixed} orphaned tool_result block(s) in {sessions_fixed} session(s). Backups created."
+        return f"No orphaned tool_result blocks found.{skipped_note}"
+    return (
+        f"Removed {total_fixed} orphaned tool_result block(s) in {sessions_fixed} session(s). "
+        f"Backups created.{skipped_note}"
+    )
 
 
 def check_claude_json_corruption() -> CheckResult:

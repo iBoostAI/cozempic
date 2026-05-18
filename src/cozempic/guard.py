@@ -590,10 +590,6 @@ def start_guard(
                     print()
 
     except KeyboardInterrupt:
-        # Stop reactive watcher
-        if overflow_watcher:
-            overflow_watcher.stop()
-
         # Final checkpoint before exit
         checkpoint_team(session_path=session_path, quiet=True)
         total_prunes = prune_count + soft_prune_count
@@ -601,6 +597,17 @@ def start_guard(
             print(f"\n  Guard stopped. Pruned {total_prunes}x during this session.")
         else:
             print(f"\n  Guard stopped.")
+    finally:
+        # Stop reactive watcher on ALL exit paths (KeyboardInterrupt and the
+        # four `break` paths inside the main loop: file disappeared,
+        # Claude exited, Hard2 reload, Hard1 reload). Previously the watcher
+        # thread would leak past normal-exit breaks and fire one more
+        # recovery on a dead session.
+        if overflow_watcher:
+            try:
+                overflow_watcher.stop()
+            except Exception:
+                pass
 
 
 def guard_prune_cycle(
