@@ -17,6 +17,7 @@ This is the test the 2026-05-18 crash report asked for explicitly:
   > concurrently with the same SESSION_ID and counts the spawned daemons
   > — must be <= 1.
 """
+
 import json
 import os
 import shutil
@@ -27,7 +28,6 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS_JSON = REPO_ROOT / "src" / "cozempic" / "data" / "hooks.json"
@@ -129,7 +129,9 @@ class TestHookSpawnIdempotency(unittest.TestCase):
             esac
             exit 0
         """))
-        stub_path.chmod(stub_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        stub_path.chmod(
+            stub_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
 
         # Neutralize upgrade chain: stub `uv` and `pip` to no-ops so the
         # SessionStart hook's `uv pip install --upgrade cozempic ...` and
@@ -162,12 +164,14 @@ class TestHookSpawnIdempotency(unittest.TestCase):
         # fallback is unreachable. But disabling the cozempic package
         # discovery in PYTHONPATH belt-and-suspenders for hermeticity.
         env["PYTHONPATH"] = ""
-        payload = json.dumps({
-            "session_id": self.session_id,
-            "transcript_path": f"/tmp/{self.session_id}.jsonl",
-            "hook_event_name": "SessionStart",
-            "source": "startup",
-        })
+        payload = json.dumps(
+            {
+                "session_id": self.session_id,
+                "transcript_path": f"/tmp/{self.session_id}.jsonl",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }
+        )
         return subprocess.run(
             ["bash", "-c", hook_cmd],
             input=payload,
@@ -205,13 +209,17 @@ class TestHookSpawnIdempotency(unittest.TestCase):
         """Baseline: one hook fire → one `guard --daemon` spawn."""
         cmd = _load_session_start_command()
         result = self._run_hook_once(cmd)
-        self.assertEqual(result.returncode, 0,
-            f"hook exited non-zero. stderr={result.stderr!r}")
+        self.assertEqual(
+            result.returncode, 0, f"hook exited non-zero. stderr={result.stderr!r}"
+        )
         self._wait_for_background_subshells()
         spawns = self._count_daemon_spawns()
-        self.assertEqual(spawns, 1,
+        self.assertEqual(
+            spawns,
+            1,
             f"Expected exactly 1 daemon spawn on cold start, got {spawns}. "
-            f"Log: {self.invocation_log.read_text() if self.invocation_log.exists() else '(empty)'}")
+            f"Log: {self.invocation_log.read_text() if self.invocation_log.exists() else '(empty)'}",
+        )
 
     def test_concurrent_fires_spawn_at_most_one(self):
         """The 2026-05-18 crash signature: two SessionStart hooks fire 2 ms
@@ -220,22 +228,32 @@ class TestHookSpawnIdempotency(unittest.TestCase):
         env = os.environ.copy()
         env["PATH"] = f"{self.stub_bin_dir}:{env.get('PATH', '')}"
         env["PYTHONPATH"] = ""
-        payload = json.dumps({
-            "session_id": self.session_id,
-            "transcript_path": f"/tmp/{self.session_id}.jsonl",
-            "hook_event_name": "SessionStart",
-            "source": "resume",
-        })
+        payload = json.dumps(
+            {
+                "session_id": self.session_id,
+                "transcript_path": f"/tmp/{self.session_id}.jsonl",
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+            }
+        )
         # Fire two processes nearly simultaneously. We start both then wait
         # for both to return; the hook backgrounds its subshell so the parent
         # bash exits quickly (~50 ms).
         p1 = subprocess.Popen(
-            ["bash", "-c", cmd], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
+            ["bash", "-c", cmd],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
         )
         p2 = subprocess.Popen(
-            ["bash", "-c", cmd], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
+            ["bash", "-c", cmd],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
         )
         p1.communicate(payload, timeout=30)
         p2.communicate(payload, timeout=30)
@@ -243,12 +261,15 @@ class TestHookSpawnIdempotency(unittest.TestCase):
         self.assertEqual(p2.returncode, 0)
         self._wait_for_background_subshells()
         spawns = self._count_daemon_spawns()
-        self.assertLessEqual(spawns, 1,
+        self.assertLessEqual(
+            spawns,
+            1,
             f"Concurrent SessionStart fires spawned {spawns} daemons for "
             f"session {self.session_id} (expected <=1). "
             f"This is the bug from /tmp/cozempic_guard_c492ae5e-971.log "
             f"where two `--- Guard daemon started ---` lines appeared 2 ms apart. "
-            f"Log: {self.invocation_log.read_text() if self.invocation_log.exists() else '(empty)'}")
+            f"Log: {self.invocation_log.read_text() if self.invocation_log.exists() else '(empty)'}",
+        )
 
     def test_fast_path_skips_spawn_when_pid_file_live(self):
         """If the guard PID file already points to a live process for THIS
@@ -280,11 +301,14 @@ class TestHookSpawnIdempotency(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self._wait_for_background_subshells()
             spawns = self._count_daemon_spawns()
-            self.assertEqual(spawns, 0,
+            self.assertEqual(
+                spawns,
+                0,
                 f"Expected 0 daemon spawns when PID file points to live process, "
                 f"got {spawns}. The fast-path is broken — every SessionStart will "
                 f"redundantly respawn the daemon, defeating the v7 idempotency "
-                f"contract. Log: {self.invocation_log.read_text() if self.invocation_log.exists() else '(empty)'}")
+                f"contract. Log: {self.invocation_log.read_text() if self.invocation_log.exists() else '(empty)'}",
+            )
         finally:
             sleeper.terminate()
             try:

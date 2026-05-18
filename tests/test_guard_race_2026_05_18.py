@@ -99,7 +99,9 @@ def _race_worker(
         try:
             barrier_handle.wait(timeout=5.0)
         except Exception as e:  # BrokenBarrierError or timeout
-            result_queue.put({"error": f"barrier failed: {e!r}", "worker": worker_index})
+            result_queue.put(
+                {"error": f"barrier failed: {e!r}", "worker": worker_index}
+            )
             return
 
         try:
@@ -210,8 +212,7 @@ class TestR1_DaemonProcessRace(unittest.TestCase):
             self.fail(
                 f"Process-vs-process race produced bad outcomes in "
                 f"{len(failures)}/{self.ITERATIONS} iterations.\n"
-                f"First 3 failure records:\n"
-                + "\n".join(repr(f) for f in failures[:3])
+                f"First 3 failure records:\n" + "\n".join(repr(f) for f in failures[:3])
             )
 
 
@@ -306,14 +307,23 @@ class TestR2_HardThresholdZeroByteLoop(unittest.TestCase):
         # ---- Mock the assorted infrastructure called by start_guard -------
         # checkpoint_team returns the fake state; load_messages returns []
         # so detect_context_window can run; record_session is a no-op.
+        # Per H4 hygiene fix: patch ``guard_mod.time.sleep`` explicitly
+        # rather than replacing the whole ``time`` module with a Mock.
+        # Symmetric with test_guard_hard_loop_backoff.py — leaves the rest
+        # of the time module intact so future code paths under test that
+        # add new time.* calls don't break with confusing TypeErrors.
         with (
-            patch.object(guard_mod, "time") as fake_time_mod,
-            patch.object(guard_mod, "_resolve_session_by_id", return_value=fake_session),
+            patch.object(guard_mod.time, "sleep", side_effect=fake_sleep),
+            patch.object(
+                guard_mod, "_resolve_session_by_id", return_value=fake_session
+            ),
             patch.object(guard_mod, "find_current_session", return_value=fake_session),
             patch.object(guard_mod, "find_claude_pid", return_value=None),
             patch.object(guard_mod, "checkpoint_team", return_value=_FakeState()),
             patch.object(guard_mod, "guard_prune_cycle", side_effect=fake_prune_cycle),
-            patch.object(guard_mod, "quick_token_estimate", side_effect=fake_quick_token_estimate),
+            patch.object(
+                guard_mod, "quick_token_estimate", side_effect=fake_quick_token_estimate
+            ),
             patch.object(guard_mod, "load_messages", return_value=[]),
             patch("cozempic.session.record_session"),
             patch.object(guard_mod, "_cleanup_stale_watchers"),
@@ -322,13 +332,6 @@ class TestR2_HardThresholdZeroByteLoop(unittest.TestCase):
             patch.object(guard_mod, "cleanup_old_backups"),
             patch("cozempic.tokens.detect_context_window", return_value=1_000_000),
         ):
-            # Wire time.sleep on the module reference (start_guard uses ``time.sleep``)
-            fake_time_mod.sleep.side_effect = fake_sleep
-            # time.time/etc are also used by _now; route through the real module
-            real_time = time
-            fake_time_mod.time = real_time.time
-            fake_time_mod.strftime = real_time.strftime
-            fake_time_mod.localtime = real_time.localtime
 
             # Run the loop. Expect either:
             #   - the loop exits cleanly under a back-off path (PASS), or
@@ -358,7 +361,8 @@ class TestR2_HardThresholdZeroByteLoop(unittest.TestCase):
                 # than max_cycles proves the loop bounded itself.
                 self.assertIn(e.code, (0, None, 1, 2), f"unexpected exit code {e.code}")
                 self.assertLess(
-                    len(sleep_calls), max_cycles,
+                    len(sleep_calls),
+                    max_cycles,
                     f"Loop exited but recorded {len(sleep_calls)} sleeps "
                     f"(>= max_cycles={max_cycles}); back-off was ineffective.",
                 )
@@ -412,17 +416,19 @@ class TestR2_HardThresholdZeroByteLoop(unittest.TestCase):
             # signal, or a setup bug. Accept it as PASS only if it carries
             # a message suggesting back-off was the cause.
             msg = str(raised).lower()
-            if not any(kw in msg for kw in ("backoff", "back-off", "stalled", "ineffective", "0 bytes")):
-                self.fail(
-                    f"Unexpected exception (not back-off-related): {raised!r}"
-                )
+            if not any(
+                kw in msg
+                for kw in ("backoff", "back-off", "stalled", "ineffective", "0 bytes")
+            ):
+                self.fail(f"Unexpected exception (not back-off-related): {raised!r}")
 
         # If we got here, raised is None — loop completed cleanly.
         # That's an acceptable post-fix behavior IF the prune count is small.
         self.assertLess(
-            prune_call_count["n"], max_cycles - 5,
+            prune_call_count["n"],
+            max_cycles - 5,
             f"Loop returned cleanly but ran {prune_call_count['n']} prunes "
-            f"— that's the bug (no back-off, no exit, just exhausted sleeps)."
+            f"— that's the bug (no back-off, no exit, just exhausted sleeps).",
         )
 
 

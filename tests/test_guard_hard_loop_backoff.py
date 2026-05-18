@@ -41,10 +41,7 @@ class TestHardLoopBackoffHelper(unittest.TestCase):
     locked in without depending on the larger guard loop."""
 
     def test_returns_interval_below_backoff_start(self):
-        from cozempic.guard import (
-            HARD_LOOP_BACKOFF_START,
-            _hard_loop_backoff_sleep,
-        )
+        from cozempic.guard import HARD_LOOP_BACKOFF_START, _hard_loop_backoff_sleep
 
         for k in range(HARD_LOOP_BACKOFF_START):
             self.assertEqual(_hard_loop_backoff_sleep(k, 30), 30)
@@ -57,7 +54,8 @@ class TestHardLoopBackoffHelper(unittest.TestCase):
         expected = {3: 60, 4: 120, 5: 240, 6: 300, 7: 300, 8: 300, 9: 300}
         for k, want in expected.items():
             self.assertEqual(
-                _hard_loop_backoff_sleep(k, 30), want,
+                _hard_loop_backoff_sleep(k, 30),
+                want,
                 f"K={k}: expected {want}s, got {_hard_loop_backoff_sleep(k, 30)}",
             )
 
@@ -125,14 +123,26 @@ class TestHardLoopExitAndReset(unittest.TestCase):
                 "reloading": False,
             }
 
+        # H4 fix: patch ``guard_mod.time.sleep`` explicitly rather than
+        # replacing the whole ``time`` module on guard_mod with a Mock.
+        # The prior full-module mock silently returned MagicMocks for any
+        # ``time.*`` attribute the test forgot to back-patch (time.monotonic,
+        # time.perf_counter, etc.), so any future code path under test that
+        # added another time.* call would fail with a confusing TypeError
+        # in arithmetic comparisons. Per-attribute patch leaves the rest of
+        # the time module intact and only intercepts the one call we care
+        # about. Matches the pattern used in 5 other test files in this
+        # repo (search ``patch.object\(.*time.*sleep``).
         with (
-            patch.object(guard_mod, "time") as fake_time_mod,
+            patch.object(guard_mod.time, "sleep", side_effect=fake_sleep),
             patch.object(guard_mod, "_resolve_session_by_id", return_value=session),
             patch.object(guard_mod, "find_current_session", return_value=session),
             patch.object(guard_mod, "find_claude_pid", return_value=None),
             patch.object(guard_mod, "checkpoint_team", return_value=_FakeState()),
             patch.object(guard_mod, "guard_prune_cycle", side_effect=fake_prune_cycle),
-            patch.object(guard_mod, "quick_token_estimate", return_value=token_estimate),
+            patch.object(
+                guard_mod, "quick_token_estimate", return_value=token_estimate
+            ),
             patch.object(guard_mod, "load_messages", return_value=[]),
             patch("cozempic.session.record_session"),
             patch.object(guard_mod, "_cleanup_stale_watchers"),
@@ -141,12 +151,6 @@ class TestHardLoopExitAndReset(unittest.TestCase):
             patch.object(guard_mod, "cleanup_old_backups"),
             patch("cozempic.tokens.detect_context_window", return_value=1_000_000),
         ):
-            fake_time_mod.sleep.side_effect = fake_sleep
-            real_time = time
-            fake_time_mod.time = real_time.time
-            fake_time_mod.strftime = real_time.strftime
-            fake_time_mod.localtime = real_time.localtime
-
             captured = io.StringIO()
             with patch.object(sys, "stdout", captured):
                 try:
@@ -184,19 +188,20 @@ class TestHardLoopExitAndReset(unittest.TestCase):
 
         result = self._run_loop([0.0] * (HARD_LOOP_EXIT_THRESHOLD + 2))
         self.assertEqual(
-            result["exit_code"], 0,
+            result["exit_code"],
+            0,
             f"Expected sys.exit(0); got exit_code={result['exit_code']!r}, "
             f"raised={result['raised']!r}",
         )
         self.assertIn(
-            "powerless against live-context dominance", result["stdout"],
+            "powerless against live-context dominance",
+            result["stdout"],
             "Diagnostic message was not printed before exit",
         )
 
     def test_counter_resets_on_successful_prune(self):
         """A successful prune (>0 saved_mb) resets the consecutive counter,
         so a subsequent burst of 0-byte prunes alone is NOT enough to exit."""
-        from cozempic.guard import HARD_LOOP_EXIT_THRESHOLD
 
         # 5 zeros, then a successful prune, then 5 more zeros.
         # If the counter reset works, total 0-byte consecutive count tops out
