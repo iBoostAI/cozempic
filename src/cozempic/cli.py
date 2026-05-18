@@ -17,7 +17,7 @@ from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .helpers import is_ssh_session, shell_quote
-from .session import find_claude_pid, find_current_session, find_sessions, get_session_cwd, load_messages, project_slug_to_path, resolve_session, save_messages
+from .session import _PruneLock, PruneConflictError, PruneLockError, find_claude_pid, find_current_session, find_sessions, get_session_cwd, load_messages, project_slug_to_path, resolve_session, save_messages, snapshot_session
 from .tokens import estimate_session_tokens, quick_token_estimate, calibrate_ratio
 from .types import PrescriptionResult, StrategyResult
 
@@ -267,6 +267,10 @@ def cmd_diagnose(args):
 
 def cmd_treat(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
+    # Take snapshot BEFORE load so append-conflict detection in save_messages
+    # can correctly identify if Claude wrote new lines mid-prune. Only needed
+    # for execute path but cheap to compute always.
+    snapshot = snapshot_session(path) if getattr(args, "execute", False) else None
     messages = load_messages(path)
     rx_name = args.rx or "standard"
 
@@ -330,7 +334,17 @@ def cmd_treat(args):
                 print("  Aborted — wait for tasks to complete or pass --force to override.")
                 return
 
-        backup = save_messages(path, new_messages, create_backup=True)
+        # Acquire per-session prune lock + pass snapshot for append-conflict detection.
+        # Prevents corruption when the guard daemon is mid-prune on the same session.
+        try:
+            with _PruneLock(path):
+                backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
+        except PruneLockError:
+            print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
+            sys.exit(2)
+        except PruneConflictError as exc:
+            print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
+            sys.exit(3)
         print(f"  Applied to {path}")
         if backup:
             print(f"  Backup: {backup}")
@@ -362,6 +376,8 @@ def cmd_treat(args):
 
 def cmd_strategy(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
+    # Take snapshot before load for append-conflict detection on execute path
+    snapshot = snapshot_session(path) if getattr(args, "execute", False) else None
     messages = load_messages(path)
 
     if args.name not in STRATEGIES:
@@ -392,7 +408,17 @@ def cmd_strategy(args):
 
     if args.execute:
         new_messages = execute_actions(messages, sr.actions)
-        backup = save_messages(path, new_messages, create_backup=True)
+        # Acquire per-session prune lock + pass snapshot for append-conflict
+        # detection. Same protection as cmd_treat.
+        try:
+            with _PruneLock(path):
+                backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
+        except PruneLockError:
+            print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
+            sys.exit(2)
+        except PruneConflictError as exc:
+            print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
+            sys.exit(3)
         final_bytes = sum(b for _, _, b in new_messages)
         print(f"  Applied. Final size: {fmt_bytes(final_bytes)}")
         if backup:
@@ -463,6 +489,9 @@ def cmd_reload(args):
 
     # Step 1: Apply treatment
     path = sess["path"]
+    # Snapshot BEFORE load so append-conflict detection works (Claude may write
+    # mid-prune; we need the file state at this exact instant for diff classification).
+    snapshot = snapshot_session(path)
     messages = load_messages(path)
     strategy_names = PRESCRIPTIONS[rx_name]
     config = {}
@@ -498,7 +527,19 @@ def cmd_reload(args):
     )
     print_prescription_result(pr)
 
-    backup = save_messages(path, new_messages, create_backup=True)
+    # Acquire per-session prune lock + pass snapshot. Without this, a concurrent
+    # guard daemon prune cycle would silently overwrite our pruned output (or
+    # vice versa) — exactly the data-loss bug observed in production where
+    # cmd_reload raced guard_prune_cycle's auto-fire at the 55% threshold.
+    try:
+        with _PruneLock(path):
+            backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
+    except PruneLockError:
+        print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
+        sys.exit(2)
+    except PruneConflictError as exc:
+        print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
+        sys.exit(3)
     print(f"  Applied to {path}")
     if backup:
         print(f"  Backup: {backup}")
@@ -1042,7 +1083,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 1.8.11")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.8.12")
     parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     parser.add_argument("--system-overhead-tokens", type=int, default=None, help="Override system overhead estimate (default: 21000). Increase for heavy rules/MCP configs.")
     sub = parser.add_subparsers(dest="command")

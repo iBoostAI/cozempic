@@ -140,7 +140,10 @@ def treat_session(prescription: str = "standard", execute: bool = False) -> str:
         prescription: Prescription tier — 'gentle', 'standard', or 'aggressive'.
         execute: If False (default), dry-run only. If True, apply changes with backup.
     """
-    from cozempic.session import find_current_session, load_messages, save_messages
+    from cozempic.session import (
+        _PruneLock, PruneConflictError, PruneLockError,
+        find_current_session, load_messages, save_messages, snapshot_session,
+    )
     from cozempic.registry import PRESCRIPTIONS
     from cozempic.executor import run_prescription
     from cozempic.tokens import estimate_session_tokens
@@ -156,6 +159,11 @@ def treat_session(prescription: str = "standard", execute: bool = False) -> str:
         return f"Unknown prescription '{prescription}'. Options: {', '.join(PRESCRIPTIONS)}"
 
     path = sess["path"]
+    # Take snapshot BEFORE load so append-conflict detection works (parallel
+    # to cmd_treat/cmd_strategy/cmd_reload in cli.py). Without this, a guard
+    # daemon prune cycle running concurrently could silently overwrite our
+    # output — the same data-loss path Wave 1 fixed in the CLI.
+    snapshot = snapshot_session(path) if execute else None
     messages = load_messages(path)
     strategy_names = PRESCRIPTIONS[prescription]
 
@@ -196,7 +204,21 @@ def treat_session(prescription: str = "standard", execute: bool = False) -> str:
         lines.append(f"  {sr.strategy_name}: {sr_saved / 1024:.1f}KB saved — {sr.summary}")
 
     if execute:
-        backup = save_messages(path, new_messages, create_backup=True)
+        # Acquire per-session prune lock + pass snapshot for append-conflict
+        # detection. Prevents the same data-loss bug that hit cmd_treat in
+        # production (where a guard daemon mid-prune would clobber/be
+        # clobbered by the manual treat).
+        try:
+            with _PruneLock(path):
+                backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
+        except PruneLockError:
+            lines.append("")
+            lines.append("Aborted: guard daemon is mid-prune. Try again in a few seconds.")
+            return "\n".join(lines)
+        except PruneConflictError as exc:
+            lines.append("")
+            lines.append(f"Aborted: session changed mid-prune (Claude wrote new lines). {exc}")
+            return "\n".join(lines)
         lines.append("")
         lines.append(f"Treatment applied to {path.name}")
         if backup:

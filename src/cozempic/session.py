@@ -405,18 +405,17 @@ def _load_sidecar() -> dict:
 
 
 def _save_sidecar(data: dict) -> None:
-    """Atomically write the sidecar store."""
-    p = get_sidecar_path()
-    tmp = p.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, p)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    """Atomically write the sidecar store via mkstemp.
+
+    Two concurrent guard daemons calling record_session can no longer
+    collide on a shared `.tmp` filename (the bug that caused
+    `FileNotFoundError: cozempic-sessions.tmp -> cozempic-sessions.json`
+    in production when SessionStart fires twice within the same ms).
+    Use record_session() if you need read-modify-write atomicity — it
+    wraps load+modify+save in a host-wide flock to prevent lost updates.
+    """
+    from .helpers import atomic_write_text
+    atomic_write_text(get_sidecar_path(), json.dumps(data, indent=2))
 
 
 def record_session(
@@ -432,22 +431,28 @@ def record_session(
     """
     if not session_id or not cwd:
         return
-    data = _load_sidecar()
-    existing = data.get(session_id, {})
-    now = datetime.now().isoformat(timespec="seconds")
-    data[session_id] = {
-        "cwd": cwd,
-        "context_window": (
-            context_window if context_window is not None
-            else existing.get("context_window")
-        ),
-        "created_at": existing.get("created_at", now),
-        "last_seen_at": now,
-    }
-    if len(data) > _SIDECAR_MAX_ENTRIES:
-        by_age = sorted(data, key=lambda k: data[k].get("last_seen_at", ""), reverse=True)
-        data = {k: data[k] for k in by_age[:_SIDECAR_MAX_ENTRIES]}
-    _save_sidecar(data)
+    # Wrap read+modify+write in a host-wide flock so two concurrent guard
+    # daemons don't lose each other's updates. atomic_write_text inside
+    # _save_sidecar handles the tmp-file collision; this lock handles
+    # the lost-update race that atomic-write alone can't fix.
+    from .helpers import _HostFileLock
+    with _HostFileLock(get_sidecar_path()):
+        data = _load_sidecar()
+        existing = data.get(session_id, {})
+        now = datetime.now().isoformat(timespec="seconds")
+        data[session_id] = {
+            "cwd": cwd,
+            "context_window": (
+                context_window if context_window is not None
+                else existing.get("context_window")
+            ),
+            "created_at": existing.get("created_at", now),
+            "last_seen_at": now,
+        }
+        if len(data) > _SIDECAR_MAX_ENTRIES:
+            by_age = sorted(data, key=lambda k: data[k].get("last_seen_at", ""), reverse=True)
+            data = {k: data[k] for k in by_age[:_SIDECAR_MAX_ENTRIES]}
+        _save_sidecar(data)
 
 
 def get_session_cwd(session_id: str) -> str | None:
@@ -669,9 +674,19 @@ def save_messages(
 
     Returns the backup path if created, else None.
     """
-    tmp_path = path.with_suffix(".tmp")
+    # Use mkstemp for collision-safe tmp filename. Previously this was
+    # path.with_suffix(".tmp") — two concurrent prune cycles on the same
+    # session (which the _PruneLock should prevent, but doctor.py and
+    # cmd_reload bypassed it) collided on a single tmp path, causing
+    # FileNotFoundError on the loser's os.replace.
+    import tempfile as _tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = _tempfile.mkstemp(
+        prefix=".tmp.", suffix=path.name, dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_name)
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             for _, msg, _ in messages:
                 if msg.get("_parse_error"):
                     f.write(msg["_raw"] + "\n")

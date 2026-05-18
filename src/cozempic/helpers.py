@@ -5,9 +5,116 @@ from __future__ import annotations
 import copy
 import json as _json
 import os
+import tempfile as _tempfile
 from pathlib import Path as _Path
 
 _SAVINGS_FILE = _Path.home() / ".cozempic_savings.json"
+
+
+# ── Atomic write primitive ──────────────────────────────────────────────────
+#
+# Used by all single-writer-per-host paths (_save_sidecar, record_savings,
+# save_messages, doctor.fix_corrupted_tool_use). Each call uses a unique
+# tempfile name via mkstemp so two concurrent writers don't clobber each
+# other's tmp file mid-rename. fsync before replace guarantees the new bytes
+# are durable before the rename, so power-loss or OOM-kill leaves the target
+# either fully-old or fully-new — never zeroed.
+
+def atomic_write_text(target: _Path, data: str, encoding: str = "utf-8") -> None:
+    """Atomic, collision-safe text write.
+
+    Two concurrent calls on the same `target` BOTH succeed without losing
+    each other's tmp file (each gets a unique mkstemp name). The final
+    `os.replace` is atomic; last writer wins for the target content, but
+    neither raises FileNotFoundError from a stolen tmp file.
+
+    For read-modify-write workflows (e.g. record_savings), callers must
+    additionally wrap the read+modify+write cycle in a file lock to prevent
+    lost-update races — atomic-write alone doesn't protect against that.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = _tempfile.mkstemp(
+        prefix=".tmp.", suffix=target.name, dir=str(target.parent)
+    )
+    tmp_path = _Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync unsupported on some filesystems — atomicity still
+                # provided by os.replace, just without durability guarantee.
+                pass
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+class _HostFileLock:
+    """Per-host advisory lock around a file path.
+
+    Used to serialize read-modify-write cycles on shared state files
+    (cozempic-sessions.json, .cozempic_savings.json). The lock is keyed
+    on a companion `.lock` file alongside the target; the target itself
+    is never opened by the lock.
+
+    POSIX: fcntl.flock — blocks other processes that take the same lock.
+    Windows: msvcrt.locking — same semantics on a per-byte basis.
+    Unknown platform: degrades to no-op (best-effort, no crash).
+    """
+    def __init__(self, target: _Path):
+        self._lock_path = target.parent / f"{target.name}.lock"
+        self._fh = None
+
+    def __enter__(self):
+        try:
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self._lock_path, "a")
+            if os.name == "nt":
+                import msvcrt
+                # Lock first byte; blocking
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            # Lock unavailable — degrade to no-op. Race window remains
+            # but writes are still atomic per atomic_write_text.
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+            self._fh = None
+        return self
+
+    def __exit__(self, *_):
+        if self._fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                # Rewind to byte 0 to unlock the same byte we locked
+                try:
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
 
 def record_savings(tokens_saved: int, total_tokens: int = 0, turn_count: int = 0) -> None:
@@ -15,30 +122,40 @@ def record_savings(tokens_saved: int, total_tokens: int = 0, turn_count: int = 0
 
     If total_tokens and turn_count are provided, estimates extra turns gained
     from the freed headroom.
+
+    Atomic-safe: read-modify-write is wrapped in a host-wide flock so two
+    concurrent prune cycles don't lose increments. Write itself uses mkstemp
+    for collision safety. Both layers degrade to best-effort on platforms
+    without fcntl/msvcrt.
     """
     if tokens_saved <= 0:
         return
     try:
-        data = _json.loads(_SAVINGS_FILE.read_text()) if _SAVINGS_FILE.exists() else {}
-    except Exception:
-        data = {}
-    data["tokens_saved"] = data.get("tokens_saved", 0) + tokens_saved
-    data["tokens_processed"] = data.get("tokens_processed", 0) + total_tokens
-    data["prune_count"] = data.get("prune_count", 0) + 1
-    if "since" not in data:
-        from datetime import date
-        data["since"] = date.today().isoformat()
+        with _HostFileLock(_SAVINGS_FILE):
+            try:
+                data = _json.loads(_SAVINGS_FILE.read_text()) if _SAVINGS_FILE.exists() else {}
+            except Exception:
+                data = {}
+            data["tokens_saved"] = data.get("tokens_saved", 0) + tokens_saved
+            data["tokens_processed"] = data.get("tokens_processed", 0) + total_tokens
+            data["prune_count"] = data.get("prune_count", 0) + 1
+            if "since" not in data:
+                from datetime import date
+                data["since"] = date.today().isoformat()
 
-    # Estimate extra turns gained from freed headroom
-    if turn_count > 0 and total_tokens > 0:
-        avg_per_turn = total_tokens / turn_count
-        if avg_per_turn > 0:
-            extra_turns = int(tokens_saved / avg_per_turn)
-            data["turns_gained"] = data.get("turns_gained", 0) + extra_turns
+            # Estimate extra turns gained from freed headroom
+            if turn_count > 0 and total_tokens > 0:
+                avg_per_turn = total_tokens / turn_count
+                if avg_per_turn > 0:
+                    extra_turns = int(tokens_saved / avg_per_turn)
+                    data["turns_gained"] = data.get("turns_gained", 0) + extra_turns
 
-    try:
-        _SAVINGS_FILE.write_text(_json.dumps(data))
+            try:
+                atomic_write_text(_SAVINGS_FILE, _json.dumps(data))
+            except Exception:
+                pass
     except Exception:
+        # Never let savings tracking crash the prune cycle
         pass
 
     # Ping global counters (anonymous, no user data, quick with short timeout)
