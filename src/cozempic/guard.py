@@ -724,16 +724,40 @@ def guard_prune_cycle(
         "reloading": False,
     }
 
-    # Trigger reload if configured — terminate Claude then auto-resume
+    # Trigger reload if configured — terminate Claude then auto-resume.
+    # Wave 2: acquire the single-flight reload lock before spawning the
+    # watcher. If another process (manual `cozempic reload`, overflow
+    # recovery, or another guard daemon instance) is already in the middle
+    # of a reload pipeline, defer ours — the prune itself completed and
+    # the user already has the saved state. Next cycle (or next user-
+    # initiated event) will re-trigger if conditions still warrant.
     if auto_reload:
         reload_pid = claude_pid if claude_pid is not None else find_claude_pid()
         if reload_pid:
-            _terminate_and_resume(
-                reload_pid, cwd,
-                session_id=session_id,
-                session_path=session_path,
+            from .reload_lock import (
+                _ReloadLock, ReloadLockHeld,
+                INIT_GUARD_HARD1, INIT_GUARD_HARD2,
             )
-            result["reloading"] = True
+            # Pick initiator based on prescription tier — aggressive ==
+            # Hard2 (80% emergency), everything else == Hard1 (55% standard).
+            initiator = INIT_GUARD_HARD2 if rx_name == "aggressive" else INIT_GUARD_HARD1
+            try:
+                with _ReloadLock(session_id or session_path.stem, initiator=initiator):
+                    _terminate_and_resume(
+                        reload_pid, cwd,
+                        session_id=session_id,
+                        session_path=session_path,
+                    )
+                    result["reloading"] = True
+            except ReloadLockHeld as exc:
+                # Another reload pipeline is already in flight — defer.
+                # Prune output is already saved; the in-flight pipeline
+                # will do the kill+resume.
+                print(
+                    f"  Reload deferred — another pipeline in flight "
+                    f"({exc.holder_initiator}, PID {exc.holder_pid})."
+                )
+                result["reloading"] = False
         else:
             resume_flag = f"--resume {session_id}" if session_id else "--resume"
             print("  WARNING: Could not find Claude PID. Pruned but not reloading.")

@@ -429,7 +429,18 @@ def cmd_strategy(args):
 
 
 def cmd_reload(args):
-    """Treat the current session, then spawn a watcher that auto-resumes Claude."""
+    """Treat the current session, then spawn a watcher that auto-resumes Claude.
+
+    Wave 2: acquires a single-flight `_ReloadLock` to prevent two reload
+    pipelines from running concurrently (manual `cozempic reload` + the
+    guard daemon's auto-fire at 55%/80% thresholds, or `OverflowRecovery`).
+    Without this lock, both spawn watchers, both osascript new terminals,
+    both try to `claude --resume` the same session → session conflict.
+    """
+    from .reload_lock import (
+        _ReloadLock, ReloadLockHeld, INIT_CLI_RELOAD, acquire_with_wait,
+    )
+
     cwd = args.cwd or os.getcwd()
     sess = None
     explicit_session = getattr(args, "session", None)
@@ -450,152 +461,210 @@ def cmd_reload(args):
         print("Use 'cozempic list' to find the session ID.", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve the project root directory for the resume cd target.
-    # The critical invariant: `claude --resume <id>` must be run from the
-    # SAME CWD where the session was originally created, because Claude Code
-    # resolves sessions by CWD → project-slug mapping. cd'ing into a
-    # subdirectory produces a different slug → "No conversation found."
-    #
-    # Priority:
-    #   1. Sidecar CWD (exact path, recorded by the guard daemon — most
-    #      reliable when available)
-    #   2. Slug reversal from the session's project directory name. The
-    #      JSONL lives at ~/.claude/projects/<slug>/<uuid>.jsonl — the slug
-    #      IS the authoritative project identifier. Reversing it gives the
-    #      original CWD. This MUST take priority over os.getcwd() because
-    #      the user (or Claude) may have cd'd into a subdirectory during
-    #      the session. (Known limitation: hyphens in the original path are
-    #      ambiguous with separator hyphens in the slug.)
-    #   3. os.getcwd() as last resort — only when sidecar is empty AND
-    #      slug reversal produces a non-existent directory (hyphen ambiguity).
-    # First try: slug reversal from the session's actual project directory.
-    # This is the most reliable source because the JSONL path directly
-    # encodes where the session was created. It only fails when the original
-    # path contained hyphens (ambiguous with the slug separator).
-    slug_cwd = project_slug_to_path(sess["project"])
-    if os.path.isdir(slug_cwd):
-        cwd = slug_cwd
-    else:
-        # Slug reversal failed (hyphens in path) — try sidecar
-        sidecar_cwd = get_session_cwd(sess["session_id"])
-        if sidecar_cwd and os.path.isdir(sidecar_cwd):
-            cwd = sidecar_cwd
-        # else: cwd stays as os.getcwd() — last resort
-
-    rx_name = args.rx or "standard"
-    if rx_name not in PRESCRIPTIONS:
-        print(f"Error: Unknown prescription '{rx_name}'. Options: {', '.join(PRESCRIPTIONS)}", file=sys.stderr)
-        sys.exit(1)
-
-    # Step 1: Apply treatment
-    path = sess["path"]
-    # Snapshot BEFORE load so append-conflict detection works (Claude may write
-    # mid-prune; we need the file state at this exact instant for diff classification).
-    snapshot = snapshot_session(path)
-    messages = load_messages(path)
-    strategy_names = PRESCRIPTIONS[rx_name]
-    config = {}
-    if args.thinking_mode:
-        config["thinking_mode"] = args.thinking_mode
-
-    original_bytes = sum(b for _, _, b in messages)
-    original_count = len(messages)
-
-    # Token estimate before pruning — capture calibrated ratio before metadata-strip
-    pre_te = estimate_session_tokens(messages)
-    pre_ratio = calibrate_ratio(messages)
-
-    new_messages, strategy_results = run_prescription(messages, strategy_names, config)
-    final_bytes = sum(b for _, _, b in new_messages)
-    final_count = len(new_messages)
-
-    # Token estimate after pruning — pass pre-calibrated ratio
-    post_te = estimate_session_tokens(new_messages, pre_calibrated_ratio=pre_ratio)
-
-    pr = PrescriptionResult(
-        prescription_name=rx_name,
-        strategy_results=strategy_results,
-        original_total_bytes=original_bytes,
-        final_total_bytes=final_bytes,
-        original_message_count=original_count,
-        final_message_count=final_count,
-        original_tokens=pre_te.total,
-        final_tokens=post_te.total,
-        token_method=pre_te.method,
-        model=pre_te.model,
-        context_window=pre_te.context_window,
-    )
-    print_prescription_result(pr)
-
-    # Acquire per-session prune lock + pass snapshot. Without this, a concurrent
-    # guard daemon prune cycle would silently overwrite our pruned output (or
-    # vice versa) — exactly the data-loss bug observed in production where
-    # cmd_reload raced guard_prune_cycle's auto-fire at the 55% threshold.
+    # Acquire the single-flight reload lock. Fail-fast by default; opt-in
+    # queueing with --wait[=SECS]. The lock is held through treatment +
+    # watcher spawn; released when this function returns (the watcher
+    # itself is a separate bash process that doesn't need to hold the lock
+    # because the actual session JSONL is protected by _PruneLock during
+    # save_messages).
+    _wait_sec = getattr(args, "wait", None)
     try:
-        with _PruneLock(path):
-            backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
-    except PruneLockError:
-        print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
+        if _wait_sec is not None:
+            _reload_lock = acquire_with_wait(
+                sess["session_id"], INIT_CLI_RELOAD, wait_seconds=float(_wait_sec),
+            )
+        else:
+            _reload_lock = _ReloadLock(sess["session_id"], initiator=INIT_CLI_RELOAD)
+            _reload_lock.__enter__()
+    except ReloadLockHeld as exc:
+        print(f"  Aborted: {exc}", file=sys.stderr)
+        if exc.wedged:
+            # Resolve the actual lock path so the user knows exactly which
+            # file to remove. Generic glob hints could wipe unrelated
+            # session locks; specificity protects other in-flight sessions.
+            from .reload_lock import _lock_path_for, WEDGE_TTL_SECONDS
+            lock_path = _lock_path_for(sess["session_id"])
+            print(
+                f"  The holding process appears wedged (>{WEDGE_TTL_SECONDS}s with no progress).",
+                file=sys.stderr,
+            )
+            print(
+                f"  If you're sure it's stuck, clear with: rm {lock_path}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  Retry in a few seconds, or pass --wait to queue.",
+                file=sys.stderr,
+            )
         sys.exit(2)
-    except PruneConflictError as exc:
-        print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
-        sys.exit(3)
-    print(f"  Applied to {path}")
-    if backup:
-        print(f"  Backup: {backup}")
-    print(f"  Final size: {fmt_bytes(final_bytes)}")
 
-    # Track lifetime savings
-    if pre_te.total and post_te.total:
-        from .helpers import record_savings, get_savings_line, get_msg_type
-        turn_count = sum(1 for _, m, _ in messages
-                       if get_msg_type(m) == "user"
-                       and isinstance(m.get("message", {}).get("content", ""), str))
-        record_savings(
-            pre_te.total - post_te.total,
-            total_tokens=pre_te.total,
-            turn_count=turn_count,
+    # From here on, wrap everything in try/finally so the lock is ALWAYS
+    # released on any exit path (return, exception, sys.exit). The lock
+    # is held through treat + watcher-spawn; released when this function
+    # returns. The bash watcher then polls claude_pid unguarded.
+    #
+    # KNOWN LIMITATION (late-fire): if a second pipeline (e.g. guard's
+    # auto-fire) starts within the sub-second window AFTER we release
+    # the lock but BEFORE the user's Claude actually exits, it can
+    # acquire the lock and spawn its own watcher. Real-world impact is
+    # small because the guard's prune-cycle timer interval (~10s) is
+    # much longer than reload spawn latency, making collision rare.
+    # Full fix would require the bash watcher to participate in the lock
+    # protocol — deferred to a future wave if observed in production.
+    try:
+
+        # Resolve the project root directory for the resume cd target.
+        # The critical invariant: `claude --resume <id>` must be run from the
+        # SAME CWD where the session was originally created, because Claude Code
+        # resolves sessions by CWD → project-slug mapping. cd'ing into a
+        # subdirectory produces a different slug → "No conversation found."
+        #
+        # Priority:
+        #   1. Sidecar CWD (exact path, recorded by the guard daemon — most
+        #      reliable when available)
+        #   2. Slug reversal from the session's project directory name. The
+        #      JSONL lives at ~/.claude/projects/<slug>/<uuid>.jsonl — the slug
+        #      IS the authoritative project identifier. Reversing it gives the
+        #      original CWD. This MUST take priority over os.getcwd() because
+        #      the user (or Claude) may have cd'd into a subdirectory during
+        #      the session. (Known limitation: hyphens in the original path are
+        #      ambiguous with separator hyphens in the slug.)
+        #   3. os.getcwd() as last resort — only when sidecar is empty AND
+        #      slug reversal produces a non-existent directory (hyphen ambiguity).
+        # First try: slug reversal from the session's actual project directory.
+        # This is the most reliable source because the JSONL path directly
+        # encodes where the session was created. It only fails when the original
+        # path contained hyphens (ambiguous with the slug separator).
+        slug_cwd = project_slug_to_path(sess["project"])
+        if os.path.isdir(slug_cwd):
+            cwd = slug_cwd
+        else:
+            # Slug reversal failed (hyphens in path) — try sidecar
+            sidecar_cwd = get_session_cwd(sess["session_id"])
+            if sidecar_cwd and os.path.isdir(sidecar_cwd):
+                cwd = sidecar_cwd
+            # else: cwd stays as os.getcwd() — last resort
+
+        rx_name = args.rx or "standard"
+        if rx_name not in PRESCRIPTIONS:
+            print(f"Error: Unknown prescription '{rx_name}'. Options: {', '.join(PRESCRIPTIONS)}", file=sys.stderr)
+            sys.exit(1)
+
+        # Step 1: Apply treatment
+        path = sess["path"]
+        # Snapshot BEFORE load so append-conflict detection works (Claude may write
+        # mid-prune; we need the file state at this exact instant for diff classification).
+        snapshot = snapshot_session(path)
+        messages = load_messages(path)
+        strategy_names = PRESCRIPTIONS[rx_name]
+        config = {}
+        if args.thinking_mode:
+            config["thinking_mode"] = args.thinking_mode
+
+        original_bytes = sum(b for _, _, b in messages)
+        original_count = len(messages)
+
+        # Token estimate before pruning — capture calibrated ratio before metadata-strip
+        pre_te = estimate_session_tokens(messages)
+        pre_ratio = calibrate_ratio(messages)
+
+        new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+        final_bytes = sum(b for _, _, b in new_messages)
+        final_count = len(new_messages)
+
+        # Token estimate after pruning — pass pre-calibrated ratio
+        post_te = estimate_session_tokens(new_messages, pre_calibrated_ratio=pre_ratio)
+
+        pr = PrescriptionResult(
+            prescription_name=rx_name,
+            strategy_results=strategy_results,
+            original_total_bytes=original_bytes,
+            final_total_bytes=final_bytes,
+            original_message_count=original_count,
+            final_message_count=final_count,
+            original_tokens=pre_te.total,
+            final_tokens=post_te.total,
+            token_method=pre_te.method,
+            model=pre_te.model,
+            context_window=pre_te.context_window,
         )
-        savings = get_savings_line()
-        if savings:
-            print(f"  {savings}")
-    print()
+        print_prescription_result(pr)
 
-    # Step 2: Generate recap from the pruned messages
-    import tempfile
-    recap_path = Path(tempfile.gettempdir()) / f"cozempic_recap_{sess['session_id'][:8]}.txt"
-    save_recap(new_messages, recap_path)
-    print(f"  Recap saved to {recap_path}")
+        # Acquire per-session prune lock + pass snapshot. Without this, a concurrent
+        # guard daemon prune cycle would silently overwrite our pruned output (or
+        # vice versa) — exactly the data-loss bug observed in production where
+        # cmd_reload raced guard_prune_cycle's auto-fire at the 55% threshold.
+        try:
+            with _PruneLock(path):
+                backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
+        except PruneLockError:
+            print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
+            sys.exit(2)
+        except PruneConflictError as exc:
+            print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
+            sys.exit(3)
+        print(f"  Applied to {path}")
+        if backup:
+            print(f"  Backup: {backup}")
+        print(f"  Final size: {fmt_bytes(final_bytes)}")
 
-    # Step 3: Find Claude's parent PID and spawn watcher
-    claude_pid = find_claude_pid()
-    if not claude_pid:
-        print("  WARNING: Could not detect Claude Code process.")
-        print("  Treatment was applied, but auto-resume watcher was NOT started.")
-        print("  Restart Claude manually with: claude --resume")
-        return
+        # Track lifetime savings
+        if pre_te.total and post_te.total:
+            from .helpers import record_savings, get_savings_line, get_msg_type
+            turn_count = sum(1 for _, m, _ in messages
+                           if get_msg_type(m) == "user"
+                           and isinstance(m.get("message", {}).get("content", ""), str))
+            record_savings(
+                pre_te.total - post_te.total,
+                total_tokens=pre_te.total,
+                turn_count=turn_count,
+            )
+            savings = get_savings_line()
+            if savings:
+                print(f"  {savings}")
+        print()
 
-    _spawn_watcher(claude_pid, cwd, recap_path=recap_path, session_id=sess["session_id"])
+        # Step 2: Generate recap from the pruned messages
+        import tempfile
+        recap_path = Path(tempfile.gettempdir()) / f"cozempic_recap_{sess['session_id'][:8]}.txt"
+        save_recap(new_messages, recap_path)
+        print(f"  Recap saved to {recap_path}")
 
-    # Auto-send /exit via the best available method
-    from .guard import _detect_terminal_env
-    term_env = _detect_terminal_env()
+        # Step 3: Find Claude's parent PID and spawn watcher
+        claude_pid = find_claude_pid()
+        if not claude_pid:
+            print("  WARNING: Could not detect Claude Code process.")
+            print("  Treatment was applied, but auto-resume watcher was NOT started.")
+            print("  Restart Claude manually with: claude --resume")
+            return
 
-    if term_env == "tmux":
-        pane = os.environ.get("TMUX_PANE", "")
-        import subprocess as sp
-        sp.run(["tmux", "send-keys", *(["-t", pane] if pane else []), "/exit", "Enter"],
-               capture_output=True, timeout=5)
-        print(f"  Resuming with optimized context...")
-    elif term_env == "screen":
-        screen_session = os.environ.get("STY", "")
-        import subprocess as sp
-        sp.run(["screen", "-S", screen_session, "-X", "stuff", "/exit\n"],
-               capture_output=True, timeout=5)
-        print(f"  Resuming with optimized context...")
-    else:
-        print(f"  Type /exit to resume with optimized context.")
-    print()
+        _spawn_watcher(claude_pid, cwd, recap_path=recap_path, session_id=sess["session_id"])
+
+        # Auto-send /exit via the best available method
+        from .guard import _detect_terminal_env
+        term_env = _detect_terminal_env()
+
+        if term_env == "tmux":
+            pane = os.environ.get("TMUX_PANE", "")
+            import subprocess as sp
+            sp.run(["tmux", "send-keys", *(["-t", pane] if pane else []), "/exit", "Enter"],
+                   capture_output=True, timeout=5)
+            print(f"  Resuming with optimized context...")
+        elif term_env == "screen":
+            screen_session = os.environ.get("STY", "")
+            import subprocess as sp
+            sp.run(["screen", "-S", screen_session, "-X", "stuff", "/exit\n"],
+                   capture_output=True, timeout=5)
+            print(f"  Resuming with optimized context...")
+        else:
+            print(f"  Type /exit to resume with optimized context.")
+        print()
+    finally:
+        try:
+            _reload_lock.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = None, session_id: str | None = None):
@@ -1083,7 +1152,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 1.8.12")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.8.13")
     parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     parser.add_argument("--system-overhead-tokens", type=int, default=None, help="Override system overhead estimate (default: 21000). Increase for heavy rules/MCP configs.")
     sub = parser.add_subparsers(dest="command")
@@ -1128,6 +1197,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_reload.add_argument("-rx", help="Prescription: gentle, standard, aggressive (default: standard)")
     p_reload.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
     p_reload.add_argument("--session", help="Explicit session ID, UUID prefix, or .jsonl path (bypasses auto-detection)")
+    p_reload.add_argument(
+        "--wait", nargs="?", const=30, type=int, default=None,
+        metavar="SECS",
+        help="If another reload is in flight, wait up to SECS for it to finish "
+             "(default: 30 if --wait passed with no value). Without --wait, "
+             "we fail fast with exit code 2.",
+    )
 
     # checkpoint
     p_cp = sub.add_parser("checkpoint", help="Save team/agent state from the current session (no pruning)")

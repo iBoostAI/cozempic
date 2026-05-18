@@ -1,0 +1,306 @@
+"""Single-flight reload coordinator.
+
+Cozempic has THREE independent code paths that can spawn a reload watcher
+(treat session → kill Claude → spawn watcher → osascript new terminal):
+
+  1. `cozempic reload` (cli.py:cmd_reload) — user-initiated
+  2. `guard_prune_cycle` (guard.py) — auto-fired at HARD1/HARD2 thresholds
+  3. `OverflowRecovery._do_recover` (overflow.py) — reactive overflow detection
+
+Without coordination, all three can fire simultaneously. The production
+cascade we observed: user typed `/cozempic treat reload` while the guard
+daemon was already crossing its 55% threshold. Both spawned watchers. When
+the user typed `/exit`, both watchers detected Claude's death and both opened
+new terminals via osascript. Two Claudes attached to the same JSONL → session
+conflict → one exited mid-startup → confusing UX.
+
+This module provides a per-session lock that all three paths consult before
+spawning a watcher. The first to acquire wins; others see `ReloadLockHeld`
+and either fail-fast (CLI), defer to next cycle (guard), or skip (overflow).
+
+The lock file lives at `{tempfile.gettempdir()}/cozempic_reload_<sid:12>.lock`
+and contains `<pid>\\n<iso-timestamp>\\n<initiator>\\n`. Stale locks (holder
+PID is dead) are auto-cleared. Wedged locks (holder alive but lock age > 30s)
+surface as `ReloadLockHeld(wedged=True)` — operator action required.
+
+The session_id is normalized + sanitized to match the existing PID-file naming
+convention. Validation prevents path traversal via crafted session IDs.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+
+# Wedge threshold: a normal kill+resume cycle is <10s. 60s gives generous
+# headroom for slow osascript / Terminal startup / SSH-tunneled X-forwarding
+# / cold-cache macOS Terminal startup without letting a truly wedged process
+# block reloads for too long. Empirical: tmux+osascript on a busy macOS box
+# can plausibly take 30+ seconds; 60s avoids false-wedged classification.
+WEDGE_TTL_SECONDS = 60
+
+# Initiator strings — used in lock file contents + error messages for triage.
+INIT_CLI_RELOAD = "cli-reload"
+INIT_GUARD_HARD1 = "guard-hard1"
+INIT_GUARD_HARD2 = "guard-hard2"
+INIT_OVERFLOW = "overflow"
+
+# Session ID sanitization — matches _pid_file_for_session in guard.py.
+# UUIDs are hex+dashes (32 chars + 4 dashes), but session_id can be passed
+# as a path (e.g. from $TRANSCRIPT) which we normalize. Strip to first 12
+# chars for the lock filename so paths and UUIDs both produce a short slug.
+_SAFE_CHARS_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _slug_for(session_id: str) -> str:
+    """Reduce session_id to a 12-char safe slug for the lock filename.
+
+    Mirrors the pid-file naming convention in guard.py — same session
+    always produces the same slug, so the lock and pid file co-locate.
+    """
+    if not session_id:
+        return "default"
+    # If it looks like a path, take the basename and drop suffix
+    if "/" in session_id or "\\" in session_id or session_id.endswith(".jsonl"):
+        session_id = Path(session_id).stem
+    # Sanitize and truncate
+    sanitized = _SAFE_CHARS_RE.sub("_", session_id)
+    return sanitized[:12] or "default"
+
+
+def _lock_path_for(session_id: str) -> Path:
+    """Compose the lock file path for a session."""
+    slug = _slug_for(session_id)
+    return Path(tempfile.gettempdir()) / f"cozempic_reload_{slug}.lock"
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Returns True if `pid` is a live process owned by us."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        # ProcessLookupError = no such process
+        # PermissionError = process exists but owned by another user (don't
+        # touch — but treat as "not ours", which means lock is owned by a
+        # different user's process and we shouldn't disturb it)
+        return False
+    except OSError:
+        return False
+
+
+class ReloadLockHeld(Exception):
+    """Raised when the reload lock for a session is held by another process.
+
+    Attributes:
+        session_id: the session the lock guards
+        holder_pid: PID of the process holding the lock (0 if unknown)
+        holder_initiator: which code path acquired the lock
+                          (cli-reload, guard-hard1, guard-hard2, overflow)
+        age_sec: how long the lock has been held (None if unparseable)
+        wedged: True if age > WEDGE_TTL_SECONDS — operator action recommended
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        holder_pid: int = 0,
+        holder_initiator: str = "unknown",
+        age_sec: Optional[float] = None,
+        wedged: bool = False,
+    ):
+        self.session_id = session_id
+        self.holder_pid = holder_pid
+        self.holder_initiator = holder_initiator
+        self.age_sec = age_sec
+        self.wedged = wedged
+        age_str = f"{age_sec:.0f}s" if age_sec is not None else "unknown"
+        wedge_note = " [WEDGED]" if wedged else ""
+        super().__init__(
+            f"Reload lock held by {holder_initiator} (PID {holder_pid}, "
+            f"{age_str} ago){wedge_note}"
+        )
+
+
+def _read_lock_metadata(lock_path: Path) -> tuple[int, str, Optional[float]]:
+    """Parse a lock file. Returns (pid, initiator, age_sec) — best effort.
+
+    On any read/parse failure, returns (0, "unknown", None) so the caller
+    can decide whether to treat as stale.
+    """
+    try:
+        content = lock_path.read_text(encoding="utf-8").strip().split("\n")
+    except OSError:
+        return 0, "unknown", None
+    pid = 0
+    initiator = "unknown"
+    age = None
+    if len(content) >= 1:
+        try:
+            pid = int(content[0].strip())
+        except ValueError:
+            pass
+    if len(content) >= 2:
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(content[1].strip())
+            age = max(0.0, time.time() - ts.timestamp())
+        except (ValueError, IndexError):
+            pass
+    if len(content) >= 3:
+        initiator = content[2].strip() or "unknown"
+    return pid, initiator, age
+
+
+class _ReloadLock:
+    """Per-session single-flight reload lock.
+
+    Context-manager API:
+        try:
+            with _ReloadLock(session_id, initiator=INIT_CLI_RELOAD):
+                # spawn watcher / kill claude / etc
+                ...
+        except ReloadLockHeld as exc:
+            # another process is mid-reload; decide whether to retry / abort
+            ...
+
+    Implementation notes:
+      - Uses O_CREAT|O_EXCL for atomic acquisition. Two processes racing the
+        same lock will have exactly one win (POSIX guarantee).
+      - On acquisition failure, reads the existing lock to disambiguate:
+        stale (dead PID) → unlink + retry once; wedged (alive PID, age > TTL)
+        → raise with wedged=True; fresh (alive PID, age <= TTL) → raise normally.
+      - The lock is unlinked on __exit__ regardless of success/failure inside.
+      - If the holder process crashes without releasing, the lock becomes
+        stale and the next acquirer cleans it up.
+    """
+
+    def __init__(self, session_id: str, initiator: str = INIT_CLI_RELOAD):
+        self.session_id = session_id
+        self.initiator = initiator
+        self._lock_path = _lock_path_for(session_id)
+        self._owned = False
+
+    def __enter__(self) -> "_ReloadLock":
+        self._acquire()
+        return self
+
+    def __exit__(self, *_):
+        if self._owned:
+            try:
+                self._lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._owned = False
+
+    def _try_create(self) -> bool:
+        """Attempt atomic O_CREAT|O_EXCL. Returns True if we created it.
+
+        Uses O_NOFOLLOW to defeat symlink attacks: a local attacker who
+        can write to /tmp could plant a symlink at our lock path pointing
+        at an arbitrary file; without O_NOFOLLOW, our O_CREAT would
+        follow the link. O_NOFOLLOW makes us fail (with ELOOP) on
+        symlink targets, which is the correct conservative behavior.
+        """
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        # O_NOFOLLOW exists on POSIX (Linux + macOS); not on Windows
+        # where tempfile.gettempdir() is per-user anyway.
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(str(self._lock_path), flags, 0o600)
+        except FileExistsError:
+            return False
+        except OSError:
+            return False
+        try:
+            from datetime import datetime
+            payload = (
+                f"{os.getpid()}\n"
+                f"{datetime.now().isoformat(timespec='seconds')}\n"
+                f"{self.initiator}\n"
+            )
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        self._owned = True
+        return True
+
+    def _acquire(self) -> None:
+        # First attempt
+        if self._try_create():
+            return
+
+        # Lock exists. Inspect.
+        pid, initiator, age = _read_lock_metadata(self._lock_path)
+
+        # Holder is dead → stale → reclaim
+        if pid > 0 and not _is_process_alive(pid):
+            try:
+                self._lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Retry once after stale cleanup
+            if self._try_create():
+                return
+            # Still failed — surface as held
+            pid, initiator, age = _read_lock_metadata(self._lock_path)
+
+        # Holder is alive and lock is fresh
+        wedged = age is not None and age > WEDGE_TTL_SECONDS
+        raise ReloadLockHeld(
+            session_id=self.session_id,
+            holder_pid=pid,
+            holder_initiator=initiator,
+            age_sec=age,
+            wedged=wedged,
+        )
+
+
+def acquire_with_wait(
+    session_id: str,
+    initiator: str,
+    wait_seconds: float = 30.0,
+    poll_interval: float = 0.5,
+) -> _ReloadLock:
+    """Try to acquire a reload lock, polling for up to `wait_seconds`.
+
+    Used by `cozempic reload --wait` to give the user an opt-in queueing
+    behavior instead of fail-fast. The poll interval is short so we don't
+    hold up the user when the lock is released quickly.
+
+    Wedged locks (age > WEDGE_TTL_SECONDS) surface immediately — waiting
+    on a wedged process is futile; the operator needs to intervene.
+
+    Prints a one-time "queued, waiting" notice on the first failed attempt
+    so the user knows we're polling rather than hung.
+
+    Returns an ENTERED lock — caller must use `try/finally` to release.
+    Raises `ReloadLockHeld` if the wait expires (or immediately if wedged).
+    """
+    import sys
+    deadline = time.monotonic() + wait_seconds
+    notified = False
+    while True:
+        lock = _ReloadLock(session_id, initiator=initiator)
+        try:
+            lock._acquire()
+            return lock
+        except ReloadLockHeld as exc:
+            if exc.wedged:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            if not notified:
+                print(
+                    f"  Queued; waiting up to {wait_seconds:.0f}s for in-flight "
+                    f"reload ({exc.holder_initiator}, PID {exc.holder_pid}) to finish...",
+                    file=sys.stderr,
+                )
+                notified = True
+            time.sleep(poll_interval)
