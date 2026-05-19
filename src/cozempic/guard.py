@@ -29,8 +29,33 @@ from pathlib import Path
 # Per-session spawn lock: prevents a concurrent _is_guard_running_for_session
 # from treating a live O_CREAT placeholder as a stale file (within the same
 # process). Keyed by session_id to avoid false contention across sessions.
+# Kept as a fast-path for single-process scenarios; the authoritative gate
+# is now ``spawn_lock.daemon_spawn_lock`` (kernel-mediated flock) which
+# spans process boundaries — see start_guard_daemon below.
 _spawn_locks: dict[str, threading.Lock] = {}
 _spawn_locks_mu = threading.Lock()
+
+
+# ── HARD-threshold back-off + exit constants ────────────────────────────────
+# When ``guard_prune_cycle`` keeps returning saved_bytes == 0 at the HARD
+# threshold (because the live conversation is dominated by immutable tool-
+# result blocks the soft prune cannot touch), the daemon used to loop at the
+# original 30s interval indefinitely — production log showed 265 cycles over
+# 5h21m. The current contract:
+#
+#   K < HARD_LOOP_BACKOFF_START   → sleep ``interval`` (original cadence)
+#   K >= HARD_LOOP_BACKOFF_START  → sleep min(interval * 2 ** (K - 2),
+#                                              HARD_LOOP_BACKOFF_CAP_SECONDS)
+#   K >= HARD_LOOP_EXIT_THRESHOLD → log diagnostic, write final checkpoint,
+#                                   sys.exit(0). SessionStart hook will respawn.
+#
+# Any prune that returns saved_bytes > 0 resets K to 0 (counter never decays
+# on its own — only a genuine prune signals "we can still make progress").
+# The cap is 5 minutes: longer is operator-hostile (HARD threshold context
+# may genuinely need attention), shorter wastes cycles on doomed prunes.
+HARD_LOOP_BACKOFF_START = 3
+HARD_LOOP_BACKOFF_CAP_SECONDS = 300
+HARD_LOOP_EXIT_THRESHOLD = 10
 
 from ._validation import ConfigError
 from .executor import run_prescription
@@ -555,10 +580,57 @@ def start_guard(
 
                 if result.get("saved_mb", 0) <= 0:
                     consecutive_empty_hard_prunes += 1
-                    if consecutive_empty_hard_prunes >= 3:
-                        print(f"  [{_now()}] WARNING: Hard prune freed 0 bytes 3x in a row.")
-                        consecutive_empty_hard_prunes = 0
-                        time.sleep(interval * 4)
+
+                    # Exit path: the daemon is powerless against this context
+                    # (live tool-result blocks dominate; HARD prune cannot free
+                    # bytes; reload+0-byte = the cascade that crashed sessions
+                    # in production). Exit gracefully and let the SessionStart
+                    # hook respawn on next activity. Do NOT change reload-trigger
+                    # gating in guard_prune_cycle — that's not the right escape.
+                    if consecutive_empty_hard_prunes >= HARD_LOOP_EXIT_THRESHOLD:
+                        try:
+                            checkpoint_team(session_path=session_path, quiet=True)
+                        except Exception:
+                            # Checkpoint failure must not prevent exit — final
+                            # checkpoint is best-effort here; the SOFT loop above
+                            # has been writing checkpoints every cycle for the
+                            # entire run, so on-disk state is already current.
+                            pass
+                        print(
+                            f"  [{_now()}] Guard powerless against live-context "
+                            f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
+                            f"0-byte HARD prunes). Exiting — NO further guard "
+                            f"protection in this session. SessionStart fires only "
+                            f"on startup/resume/clear, NOT on tool calls or "
+                            f"message turns, so the daemon will NOT auto-respawn "
+                            f"while the session continues. To re-enable cozempic: "
+                            f"type /clear or restart the session. Recommended: "
+                            f"split work across fresh sessions to avoid >55% "
+                            f"context dominance by immutable tool-result blocks.",
+                            flush=True,
+                        )
+                        sys.exit(0)
+
+                    # Back-off path: replace the original fixed-cadence sleep at
+                    # the bottom of the loop with an exponentially growing one.
+                    # The loop's primary ``time.sleep(interval)`` at the top of
+                    # the next iteration is the normal cadence — we ADD an extra
+                    # back-off sleep here so the next prune is genuinely delayed.
+                    backoff = _hard_loop_backoff_sleep(
+                        consecutive_empty_hard_prunes, interval
+                    )
+                    # Only emit a back-off sleep beyond the normal interval to
+                    # avoid double-sleeping at K=1 / K=2 where backoff == interval.
+                    if backoff > interval:
+                        if consecutive_empty_hard_prunes == HARD_LOOP_BACKOFF_START:
+                            print(
+                                f"  [{_now()}] Hard prune freed 0 bytes "
+                                f"{HARD_LOOP_BACKOFF_START}x — entering exponential "
+                                f"back-off (next sleep: {backoff}s, cap "
+                                f"{HARD_LOOP_BACKOFF_CAP_SECONDS}s, exit after "
+                                f"{HARD_LOOP_EXIT_THRESHOLD} cycles)."
+                            )
+                        time.sleep(backoff)
                 else:
                     consecutive_empty_hard_prunes = 0
                 print()
@@ -1115,33 +1187,44 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
     )
 
 
-# UUID-shape / hex-only guard for session_id inputs to pidfile path composition.
-# 12+ chars keeps the `[:12]` truncation meaningful; the hex+dash character
-# class rejects path-traversal sequences and any non-UUID identifier. Require
-# a hex digit as the first char so pure-dash / leading-dash inputs reject —
-# real UUIDs always start with a hex digit.
-# Note: `_pid_file_for_session` lowercases session_id BEFORE matching, so the
-# regex intentionally accepts lowercase hex only (not an RFC-4122 uppercase bug).
-_SESSION_ID_RE = re.compile(r"^[0-9a-f][0-9a-f-]{11,}$")
+# Session-id validation for pidfile path composition.
+# Round-3 / DA C2 fix (Option B per team-lead + code-auditor): accepts
+# lowercase alphanumeric + underscore + dash, matching the SessionStart
+# hook bash sanitiser (`re.sub(r'[^a-z0-9_-]', '_', s.lower())`) and
+# ``reload_lock._slug_for`` / ``spawn_lock._slug_for`` (both use
+# ``[^a-zA-Z0-9_-]`` as their substitution character class). UUIDs are a
+# strict subset, so no regression for existing inputs. The first char must
+# be alphanumeric (not ``_`` or ``-``) — preserves the dash-collision
+# security property pinned by ``TestPolishV2_SessionIdRegexRequiresHexFirstChar``
+# in test_guard_hardening.py (pure-dash and leading-dash inputs would
+# otherwise collide after [:12] truncation onto the same pidfile path).
+# 12+ chars keeps the ``[:12]`` truncation meaningful and prevents
+# zero-byte slug paths.
+# Note: ``_pid_file_for_session`` lowercases session_id BEFORE matching,
+# so the regex intentionally accepts lowercase only (not an RFC-4122
+# uppercase bug — uppercase UUIDs are normalized first).
+_SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{11,}$")
 
 
 def _pid_file_for_session(session_id: str) -> Path:
     """Return the PID file path for a guard daemon watching a specific session.
 
-    Validates `session_id` against a UUID-shaped regex (hex chars + dashes,
-    length >= 12) so that path-traversal sequences or stray filename tokens
-    cannot escape `/tmp/cozempic_guard_*.pid` namespace.
-    Normalizes to lowercase BEFORE truncation so different-case variants of
+    Validates ``session_id`` against a relaxed alphanumeric+_- regex (matches
+    the bash hook sanitiser and reload_lock/spawn_lock slug rules — codebase
+    consistency, fix for DA round-1 C2 finding). Leading char must be
+    alphanumeric to prevent dash-collision after ``[:12]`` truncation
+    (security property — see ``TestPolishV2_SessionIdRegexRequiresHexFirstChar``).
+    Normalizes to lowercase BEFORE matching so different-case variants of
     the same UUID map to the same pidfile (prevents split-brain spawning).
     Raises ValueError on malformed input so callers fail fast; library-API
-    callers like `_is_guard_running_for_session` catch and return None
+    callers like ``_is_guard_running_for_session`` catch and return None
     (treat invalid session as "no daemon"). Error message logs only type
     and length — never raw content — to avoid PII leaks.
     """
     session_id = _normalize_session_id(session_id).lower()
     if not _SESSION_ID_RE.fullmatch(session_id):
         raise ValueError(
-            f"session_id must be a hex/UUID identifier (>=12 chars), "
+            f"session_id must be alphanumeric+_- (leading-alphanumeric, >=12 chars), "
             f"got {type(session_id).__name__} of length {len(session_id)}"
         )
     return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
@@ -1211,11 +1294,43 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
         os.kill(pid, 0)
         # Verify the PID is actually our guard — defend against PID reuse.
         if not _is_cozempic_guard_process(pid):
-            pid_path.unlink(missing_ok=True)
+            # Don't eagerly unlink a fresh-looking pidfile here. A peer
+            # process that just did O_CREAT|O_EXCL in DaemonSpawnClaim has
+            # written its own parent PID into the file BEFORE renaming to
+            # the daemon PID; in that brief window the holding PID is a
+            # legitimate Python process that isn't yet a cozempic guard.
+            # Treating it as PID-reuse and unlinking would destroy the
+            # peer's claim and let multiple workers spawn. Only unlink
+            # truly old pidfiles — those are real PID-reuse or genuine
+            # stale state from a crashed prior spawn. The threshold is
+            # shared with ``DaemonSpawnClaim._is_pidfile_fresh`` so both
+            # sides of the claim/probe dichotomy agree on what "fresh"
+            # means (H1 fix — single source of truth).
+            from .spawn_lock import _FRESH_PIDFILE_SECONDS
+            try:
+                age = time.time() - pid_path.stat().st_mtime
+            except OSError:
+                age = 0.0
+            if age >= _FRESH_PIDFILE_SECONDS:
+                pid_path.unlink(missing_ok=True)
             return None
         return pid
     except (ValueError, ProcessLookupError, PermissionError):
-        pid_path.unlink(missing_ok=True)
+        # Apparently dead PID — but a freshly-written pidfile that holds
+        # the soon-to-exist daemon PID can momentarily look "dead" while
+        # the daemon is still starting (a real Popen returns the child
+        # PID before the OS finishes wiring up the process; test mocks
+        # use fake PIDs that are never alive). Only unlink truly old
+        # pidfiles to avoid destroying a peer's just-completed claim
+        # and letting another worker spawn a duplicate daemon. Same
+        # threshold as the holder-alive-but-not-guard branch above.
+        from .spawn_lock import _FRESH_PIDFILE_SECONDS
+        try:
+            age = time.time() - pid_path.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age >= _FRESH_PIDFILE_SECONDS:
+            pid_path.unlink(missing_ok=True)
         return None
 
 
@@ -1336,164 +1451,167 @@ def start_guard_daemon(
     if claude_pid is None:
         claude_pid = find_claude_pid()
 
-    # Acquire the per-session spawn lock before O_CREAT so that a concurrent
-    # _is_guard_running_for_session (same process) sees the lock is held and skips
-    # the unlink of our in-flight "0" placeholder. Released after the real PID
-    # is committed. File-level O_CREAT|O_EXCL still guards cross-process races.
-    norm_sid = _normalize_session_id(session_id) if session_id else ""
-    with _spawn_locks_mu:
-        if norm_sid not in _spawn_locks:
-            _spawn_locks[norm_sid] = threading.Lock()
-        spawn_lock = _spawn_locks[norm_sid]
-    spawn_lock.acquire()
+    # ── Cross-process spawn claim (Bug 2 + Bug 3 fix, V4 rework) ────────────
+    # The PID file IS the lock. O_CREAT|O_EXCL on the PID file is the only
+    # primitive used: POSIX guarantees exactly one process wins the create,
+    # all others see EEXIST and become losers via DaemonAlreadyStarting.
+    # This mirrors reload_lock.py:200-262 (same pattern, different file).
+    #
+    # Why not fcntl.flock on a separate sentinel? Race-reproducer's V4 stress
+    # (10 processes × 30 iterations) found a textbook flock-unlink race: when
+    # the holder unlinks the sentinel on release, peers immediately O_CREAT
+    # NEW inodes and their flocks attach to those new inodes — different
+    # kernel objects, so multiple "winners" each acquire flock simultaneously.
+    # See spawn_lock.py module docstring for the full failure mode + evidence.
+    from .spawn_lock import DaemonAlreadyStarting, DaemonSpawnClaim
 
-    # Atomically claim the pid slot before spawning (O_CREAT|O_EXCL prevents TOCTOU).
-    # Other OSErrors (ENOSPC, EROFS, EACCES) are non-fatal: return started=False
-    # with a reason so the non-interactive SessionStart hook doesn't crash silently.
-    _claim_result: dict | None = None
     try:
+        claim = DaemonSpawnClaim(session_id or cwd, pid_path)
+        claim.__enter__()
+    except DaemonAlreadyStarting as exc:
+        # Peer process holds the PID-file claim. Surface their PID so the
+        # SessionStart hook can introspect / log it. holder_pid may be 0 if
+        # the file was unreadable (rare; race-reproducer's "undefined state"
+        # was an artifact of the OSError path that no longer exists).
+        return {
+            "started": False,
+            "pid": exc.holder_pid,
+            "pid_file": str(pid_path),
+            "log_file": None,
+            "already_running": True,
+        }
+
+    try:
+        # Build the guard command
+        cmd_parts = [
+            sys.executable, "-m", "cozempic.cli", "guard",
+            "--cwd", cwd,
+            "--threshold", str(threshold_mb),
+            "--interval", str(interval),
+            "-rx", rx_name,
+        ]
+        if soft_threshold_mb is not None:
+            cmd_parts.extend(["--soft-threshold", str(soft_threshold_mb)])
+        if not auto_reload:
+            cmd_parts.append("--no-reload")
+        if not reactive:
+            cmd_parts.append("--no-reactive")
+        if threshold_tokens is not None:
+            cmd_parts.extend(["--threshold-tokens", str(threshold_tokens)])
+        if soft_threshold_tokens is not None:
+            cmd_parts.extend(["--soft-threshold-tokens", str(soft_threshold_tokens)])
+        if session_id is not None:
+            cmd_parts.extend(["--session", _normalize_session_id(session_id)])
+        if claude_pid is not None:
+            cmd_parts.extend(["--claude-pid", str(claude_pid)])
+
+        # Wrap the spawn body in a graceful OSError handler so a
+        # non-interactive SessionStart hook never crashes with a stack
+        # trace. ENOSPC / EROFS / EACCES / EMFILE on /tmp surface as
+        # structured `{started: False, reason: ...}`. The claim's
+        # __exit__ will unlink the PID file on exception, so a retry is
+        # possible.
         try:
-            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # Defense-in-depth: if the log file's parent dir was removed
+            # mid-spawn (race with operator cleanup, /tmp eviction, etc.)
+            # recreate it once and retry the open.
             try:
-                os.write(fd, b"0")  # placeholder; real PID written after Popen
+                lf = open(log_file, "a", encoding="utf-8")
+            except FileNotFoundError:
+                log_dir = os.path.dirname(str(log_file))
+                if log_dir:
+                    os.makedirs(log_dir, exist_ok=True)
+                lf = open(log_file, "a", encoding="utf-8")
+
+            try:
+                from datetime import datetime
+                lf.write(f"\n--- Guard daemon started at {datetime.now().isoformat()} ---\n")
+                lf.write(f"CWD: {cwd}\n")
+                lf.write(f"CMD: {' '.join(cmd_parts)}\n\n")
+                lf.flush()
+
+                # PYTHONUNBUFFERED=1 ensures guard log output is written immediately (#14)
+                env = os.environ.copy()
+                env["PYTHONUNBUFFERED"] = "1"
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=lf,
+                    stderr=lf,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    cwd=cwd,
+                    env=env,
+                )
             finally:
-                os.close(fd)
-        except (FileExistsError, OSError) as _e:
-            if not isinstance(_e, FileExistsError):
-                _claim_result = {"started": False, "reason": f"pidfile: {_e}"}
-            else:
-                # Peek at what the existing file holds to decide the retry strategy.
+                lf.close()
+
+            # Atomically replace our parent PID (written by DaemonSpawnClaim
+            # on _claim) with the daemon's real PID. tmp+rename is atomic
+            # on the same filesystem — readers transitioning across the
+            # rename see either the parent PID (alive) or the daemon PID
+            # (alive). Never empty, never "0", never partial.
+            #
+            # CRIT C1 fix: open the .pid.tmp via os.open(O_CREAT|O_EXCL|
+            # O_NOFOLLOW) instead of Path.write_text. The default write_text
+            # follows symlinks — an attacker who pre-plants the .pid.tmp
+            # path as a symlink to ~/.zshrc or ~/.ssh/authorized_keys would
+            # have the file overwritten with the PID number. O_EXCL also
+            # surfaces orphan .pid.tmp files (from a prior SIGKILLed spawn)
+            # as a FileExistsError instead of silently truncating them,
+            # which closes a re-attack window in CRIT C3.
+            tmp_path = pid_path.with_suffix(".pid.tmp")
+            # CRIT C3 fix: catch ANY exception (not just OSError) around
+            # the write+rename block. A SIGINT/InterruptedError or other
+            # non-OSError between write_text and rename used to leak the
+            # .pid.tmp orphan; we now unlink it on every failure path.
+            try:
+                _tmp_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    _tmp_flags |= os.O_NOFOLLOW
+                _tmp_fd = os.open(str(tmp_path), _tmp_flags, 0o600)
                 try:
-                    _raw = pid_path.read_text().strip() if pid_path.exists() else ""
-                    _on_disk_pid = int(_raw) if _raw else 0
-                except (ValueError, OSError):
-                    _on_disk_pid = 0
-                if _on_disk_pid > 0:
-                    # File holds a real PID (> 0): a concurrent winner just wrote it.
-                    # Trust the write — don't call _is_guard_running_for_session (it
-                    # would probe os.kill which may fail for a just-spawned process,
-                    # unlink the file, and break the invariant). Dead-guard detection
-                    # happens on the NEXT call to start_guard_daemon.
-                    _claim_result = {
-                        "started": False,
-                        "pid": _on_disk_pid,
-                        "pid_file": str(pid_path),
-                        "log_file": None,
-                        "already_running": True,
-                    }
-                else:
-                    # File holds a placeholder (pid <= 0): either a concurrent spawn's
-                    # in-flight "0" or a stale placeholder from a previous crash.
-                    # Re-read via the full helper which handles the spawn-lock check.
-                    existing_pid = _is_guard_running_for_session(session_id) if session_id else None
-                    if existing_pid:
-                        _claim_result = {
-                            "started": False,
-                            "pid": existing_pid,
-                            "pid_file": str(pid_path),
-                            "log_file": None,
-                            "already_running": True,
-                        }
-                    else:
-                        # Stale placeholder (previous crash before real PID was written) — remove and retry once
-                        pid_path.unlink(missing_ok=True)
-                        try:
-                            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                            try:
-                                os.write(fd, b"0")
-                            finally:
-                                os.close(fd)
-                        except (FileExistsError, OSError) as _e2:
-                            if not isinstance(_e2, FileExistsError):
-                                _claim_result = {"started": False, "reason": f"pidfile: {_e2}"}
-                            else:
-                                existing_pid = _is_guard_running_for_session(session_id) if session_id else None
-                                _claim_result = {
-                                    "started": False,
-                                    "pid": existing_pid,
-                                    "pid_file": str(pid_path),
-                                    "log_file": None,
-                                    "already_running": True,
-                                }
-    except Exception:
-        spawn_lock.release()
-        raise
-    if _claim_result is not None:
-        spawn_lock.release()
-        return _claim_result
+                    os.write(_tmp_fd, f"{proc.pid}\n".encode("utf-8"))
+                finally:
+                    os.close(_tmp_fd)
+                os.rename(str(tmp_path), str(pid_path))
+            except Exception:
+                # Unlink any partial .pid.tmp we may have created so a
+                # retry can succeed. unlink is symlink-safe (operates on
+                # the directory entry, not the symlink target).
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            # Tell the claim "we wrote the real PID — leave the file in
+            # place on clean exit; the daemon now owns its lifecycle."
+            claim.handed_off = True
+        except OSError as exc:
+            # The .pid.tmp orphan was already cleaned by the inner
+            # try/except above; here we only need to surface the failure.
+            # The claim's __exit__ will unlink the .pid file because
+            # handed_off is still False, so a retry can re-claim.
+            return {
+                "started": False,
+                "reason": f"pidfile: {exc}",
+                "pid": None,
+                "pid_file": str(pid_path),
+                "log_file": None,
+                "already_running": False,
+            }
 
-    # Build the guard command
-    cmd_parts = [
-        sys.executable, "-m", "cozempic.cli", "guard",
-        "--cwd", cwd,
-        "--threshold", str(threshold_mb),
-        "--interval", str(interval),
-        "-rx", rx_name,
-    ]
-    if soft_threshold_mb is not None:
-        cmd_parts.extend(["--soft-threshold", str(soft_threshold_mb)])
-    if not auto_reload:
-        cmd_parts.append("--no-reload")
-    if not reactive:
-        cmd_parts.append("--no-reactive")
-    if threshold_tokens is not None:
-        cmd_parts.extend(["--threshold-tokens", str(threshold_tokens)])
-    if soft_threshold_tokens is not None:
-        cmd_parts.extend(["--soft-threshold-tokens", str(soft_threshold_tokens)])
-    if session_id is not None:
-        cmd_parts.extend(["--session", _normalize_session_id(session_id)])
-    if claude_pid is not None:
-        cmd_parts.extend(["--claude-pid", str(claude_pid)])
-
-    # Spawn detached process. Wrapped in try/finally so the spawn_lock is
-    # ALWAYS released and the "0" placeholder is cleaned up if Popen (or
-    # anything else in this block) raises. Without this, a FileNotFoundError
-    # from a missing Python binary or a PermissionError on the log file would
-    # leave the lock held permanently (blocking all future in-process spawns
-    # for this session) and the placeholder pidfile on disk (blocking all
-    # future cross-process spawns until manual deletion).
-    try:
-        with open(log_file, "a", encoding="utf-8") as lf:
-            from datetime import datetime
-            lf.write(f"\n--- Guard daemon started at {datetime.now().isoformat()} ---\n")
-            lf.write(f"CWD: {cwd}\n")
-            lf.write(f"CMD: {' '.join(cmd_parts)}\n\n")
-            lf.flush()
-
-            # PYTHONUNBUFFERED=1 ensures guard log output is written immediately (#14)
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            proc = subprocess.Popen(
-                cmd_parts,
-                stdout=lf,
-                stderr=lf,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                cwd=cwd,
-                env=env,
-            )
-
-        # Write actual PID atomically via temp+rename so readers never see partial content
-        tmp_path = pid_path.with_suffix(".pid.tmp")
-        tmp_path.write_text(str(proc.pid))
-        tmp_path.replace(pid_path)
-    except Exception:
-        # Cleanup: remove the "0" placeholder so future spawns aren't blocked
-        pid_path.unlink(missing_ok=True)
-        raise
+        return {
+            "started": True,
+            "pid": proc.pid,
+            "pid_file": str(pid_path),
+            "log_file": str(log_file),
+            "already_running": False,
+        }
     finally:
-        # Release the spawn lock regardless of success/failure. Any concurrent
-        # _is_guard_running_for_session can now read the valid PID > 0 (success)
-        # or find no pidfile (failure — cleaned up above).
-        spawn_lock.release()
-
-    return {
-        "started": True,
-        "pid": proc.pid,
-        "pid_file": str(pid_path),
-        "log_file": str(log_file),
-        "already_running": False,
-    }
+        # If we reach here without an exception, claim.handed_off == True
+        # and __exit__ is a no-op (daemon owns the PID file). If we raised
+        # inside the spawn body, __exit__ unlinks for retry.
+        claim.__exit__(None, None, None)
 
 
 def _is_cozempic_guard_process(pid: int) -> bool:
@@ -1532,10 +1650,15 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         if len(tokens) >= 2 and binary == "cozempic" and tokens[1] == "guard":
             return True
         return False
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, TypeError):
         # If we can't verify, err on the side of NOT signaling a potentially
         # unrelated process. The session stays with the existing daemon (or
         # no daemon), which is strictly safer than signaling the wrong one.
+        # TypeError covers the test-only case where a Popen mock returns a
+        # bare object that doesn't support the ctx-manager protocol
+        # subprocess.run uses internally; production callers never hit it,
+        # but any unhandled exception here would propagate to the
+        # non-interactive SessionStart hook surface — fail closed.
         return False
 
 
@@ -1753,6 +1876,29 @@ def reload_self_daemon(
         "log_file": result.get("log_file"),
         "reason": reason,
     }
+
+
+def _hard_loop_backoff_sleep(consecutive_empty: int, interval: int) -> int:
+    """Compute the sleep duration for the next HARD-loop cycle.
+
+    Doubles the wait starting at ``HARD_LOOP_BACKOFF_START`` consecutive
+    zero-byte HARD prunes, capped at ``HARD_LOOP_BACKOFF_CAP_SECONDS``.
+    Returns ``interval`` unchanged for K < HARD_LOOP_BACKOFF_START.
+
+    With defaults (interval=30, start=3, cap=300):
+        K=1 → 30s   (normal)
+        K=2 → 30s   (normal)
+        K=3 → 60s   (interval * 2 ** 1)
+        K=4 → 120s  (interval * 2 ** 2)
+        K=5 → 240s  (interval * 2 ** 3)
+        K=6 → 300s  (capped from 480s)
+        K=7+ → 300s (cap)
+    """
+    if consecutive_empty < HARD_LOOP_BACKOFF_START:
+        return interval
+    # Exponent grows from 1 at K=3 onwards: K - (start - 1).
+    exp = consecutive_empty - (HARD_LOOP_BACKOFF_START - 1)
+    return min(interval * (2 ** exp), HARD_LOOP_BACKOFF_CAP_SECONDS)
 
 
 def _fmt_prune_result(result: dict) -> str:

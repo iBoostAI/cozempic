@@ -289,23 +289,111 @@ class TestHostFileLockWindows(unittest.TestCase):
                             "Expected lock to degrade to no-op when msvcrt unavailable")
 
 
-# ─── Hook schema bump v5 → v6 ────────────────────────────────────────────────
+# ─── Hook schema bump v7 → v8 (round 3 — C2 slug convergence, Option B) ─────
 
-class TestHookSchemaV6(unittest.TestCase):
+class TestHookSchemaV8(unittest.TestCase):
+    """v8 converges the bash hook slug rules with Python's
+    ``_pid_file_for_session`` (round 3 — C2 fix). Per code-auditor's
+    Option B sign-off (2026-05-18): the existing bash sanitiser
+    ``re.sub(r'[^a-z0-9_-]','_', s.lower())`` is kept as the codebase
+    convention (already used in ``reload_lock._slug_for`` and
+    ``spawn_lock._slug_for``); Python's previously stricter
+    ``^[0-9a-f][0-9a-f-]{11,}$`` is RELAXED to
+    ``^[a-z0-9][a-z0-9_-]{11,}$`` so both sides accept the same character
+    set. The leading-alphanumeric anchor is preserved as a security
+    property (dash-collision defense, see
+    ``TestPolishV2_SessionIdRegexRequiresHexFirstChar``)."""
+
     def test_schema_marker_bumped(self):
         from cozempic.init import HOOK_SCHEMA_VERSION
-        self.assertEqual(HOOK_SCHEMA_VERSION, "v6")
+        self.assertEqual(HOOK_SCHEMA_VERSION, "v8")
 
     def test_no_unflocked_foreground_guard_daemon_call(self):
-        """The unflocked foreground `cozempic guard --daemon` call is REMOVED.
-        Hook should have exactly 2 occurrences of `cozempic guard --daemon`
-        in SessionStart (1 flocked + 1 python3 fallback)."""
+        """The unflocked foreground `cozempic guard --daemon` call stays removed.
+        v7's three-branch idempotency (kept verbatim in v8) wraps the spawn in
+        `if PID alive then : ; elif has flock then (flock -n 8 || exit 0;
+        spawn) 8>$STARTUP_LOCK ; else spawn ; fi`. Two branches (elif + else)
+        each carry the `cozempic guard --daemon || python3 -m cozempic guard
+        --daemon` pair, so the total occurrence count is 4 (2 branches × 2
+        fallback variants). Anything else means an unguarded branch or a
+        missing fallback."""
         hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
         hooks = json.loads(hooks_path.read_text())
         ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         count = ss_cmd.count("cozempic guard --daemon")
-        self.assertEqual(count, 2,
-            f"Expected 2 'cozempic guard --daemon' occurrences (1 primary + 1 python3 fallback inside flock), got {count}")
+        self.assertEqual(count, 4,
+            f"Expected 4 'cozempic guard --daemon' occurrences (2 branches × "
+            f"[primary + python3 fallback]), got {count}")
+
+    def test_startup_lock_present(self):
+        """v8 keeps v7's second-layer guard: when flock is available, the
+        daemon spawn runs inside a flock on a dedicated `*.startup-lock`
+        file (distinct from the existing hook-level `*.lock`). The two locks
+        MUST be distinct files so the daemon-spawn lock doesn't serialize
+        unrelated hook work. Slug source is ``${SESSION_ID:0:12}`` — the
+        bash side uses the permissive ``re.sub`` sanitiser, the same
+        12-char prefix Python now produces via the relaxed regex."""
+        hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text())
+        ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("GUARD_STARTUP_LOCK=", ss_cmd,
+            "Expected a dedicated GUARD_STARTUP_LOCK variable for the "
+            "second-layer flock guarding the daemon spawn")
+        self.assertIn("/tmp/cozempic_guard_${SESSION_ID:0:12}.startup-lock", ss_cmd,
+            "GUARD_STARTUP_LOCK path must use ${SESSION_ID:0:12} — first 12 chars "
+            "of the bash-sanitised lowercased session_id. Convergence (C2/Option B) "
+            "is achieved by Python relaxing its regex to match this character set, "
+            "not by bash tightening to match a stricter Python regex.")
+        # The startup-lock must use a DIFFERENT fd than the outer hook lock
+        # (fd 9) — otherwise the inner flock acquire would race the outer.
+        self.assertIn("flock -n 8", ss_cmd,
+            "Inner startup-lock flock must use fd 8 (outer hook lock owns fd 9)")
+        self.assertIn("8>\"$GUARD_STARTUP_LOCK\"", ss_cmd,
+            "fd 8 must be redirected to the startup-lock file via 8>\"$GUARD_STARTUP_LOCK\"")
+
+    def test_pid_fast_path_present(self):
+        """v8 keeps v7's fast-path invariant: the SessionStart hook must wrap
+        the guard --daemon spawn in a `kill -0 $(cat GUARD_PID_FILE)` fast-path
+        so a healthy daemon for the current session is NOT respawned. The
+        GUARD_PID_FILE path uses ``${SESSION_ID:0:12}`` (bash-sanitised
+        lowercased session_id, first 12 chars) — Python's relaxed regex
+        produces the same slug for the same input."""
+        hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text())
+        ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("GUARD_PID_FILE=", ss_cmd,
+            "Expected the SessionStart hook to declare GUARD_PID_FILE for the fast-path")
+        self.assertIn("kill -0", ss_cmd,
+            "Expected `kill -0` liveness probe to short-circuit redundant daemon spawns")
+        # Path must match Python's `_pid_file_for_session` convention
+        # (/tmp/cozempic_guard_<slug>.pid where <slug> = first 12 chars of
+        # the lowercased+sanitised session_id; Python validates same charset).
+        self.assertIn("/tmp/cozempic_guard_${SESSION_ID:0:12}.pid", ss_cmd,
+            "Fast-path PID file path must use ${SESSION_ID:0:12} — first 12 chars "
+            "of the bash-sanitised lowercased session_id, which (post-C2 Option B) "
+            "matches the slug Python computes via the relaxed _SESSION_ID_RE.")
+
+    def test_session_id_lowercased(self):
+        """The hook MUST lowercase the session_id before sanitising — Python's
+        ``_pid_file_for_session`` calls ``.lower()`` first, so any UPPER-case
+        UUID from Claude Code would compute a different slug in bash than in
+        Python if bash didn't also lowercase. (Pre-C2 finding was about
+        character-set divergence; this pins the case-handling parity that
+        prevents a second, narrower divergence.)"""
+        hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text())
+        ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn(".lower()", ss_cmd,
+            "session_id extraction must call .lower() to match the Python "
+            "PID file naming convention; otherwise an upper-case UUID from "
+            "Claude Code stdin would cause the fast-path to look at the "
+            "wrong file and the daemon spawn would not be deduplicated.")
+        # The bash sanitiser must use the permissive character class that
+        # mirrors Python's relaxed regex (C2 Option B convergence).
+        self.assertIn("[^a-z0-9_-]", ss_cmd,
+            "bash sanitiser must use the permissive [^a-z0-9_-] character "
+            "class that mirrors Python's relaxed _SESSION_ID_RE — same "
+            "character set as reload_lock._slug_for and spawn_lock._slug_for.")
 
     def test_plugin_and_data_hooks_synced(self):
         plugin_path = Path(__file__).parent.parent / "plugin" / "hooks" / "hooks.json"
