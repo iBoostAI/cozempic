@@ -98,7 +98,8 @@ class TestTransientDaemonReproducer(unittest.TestCase):
     def _simulate_old_daemon_exits_and_slot_freed(self):
         """Step 1: OLD daemon exits, slot is freed.
 
-        Mirrors PR #93's _safe_unlink_session_pidfile in the finally block.
+        Mirrors PR #93's _safe_unlink_session_pidfile in the finally block
+        (if present), or falls back to direct unlink for pre-PR-#93 code.
         The slot is FREE after this. In current code, NO sentinel is written.
         """
         # Write a fake OLD daemon pidfile (as if the old daemon was running)
@@ -110,17 +111,20 @@ class TestTransientDaemonReproducer(unittest.TestCase):
         )
         _pid_path().write_text(payload)
 
-        # Now simulate the old daemon's finally-block unlink
-        # _safe_unlink_session_pidfile checks: if pidfile contains MY pid, unlink
-        # We mock _pid_file_points_to to return True (we are the old daemon)
-        with patch("cozempic.guard._pid_file_points_to", return_value=True):
+        # Simulate the old daemon's finally-block unlink.
+        # PR #93 adds _safe_unlink_session_pidfile; base v1.8.14 uses direct unlink.
+        try:
             from cozempic.guard import _safe_unlink_session_pidfile
-            _safe_unlink_session_pidfile(REPRO_SESSION_ID)
+            with patch("cozempic.guard._pid_file_points_to", return_value=True):
+                _safe_unlink_session_pidfile(REPRO_SESSION_ID)
+        except ImportError:
+            # Pre-PR-#93 code: just unlink directly (same effect)
+            _pid_path().unlink(missing_ok=True)
 
         # Verify slot is free
         self.assertFalse(
             _pid_path().exists(),
-            "OLD daemon's slot was NOT freed — _safe_unlink_session_pidfile failed.",
+            "OLD daemon's slot was NOT freed — unlink failed.",
         )
 
     def _simulate_transient_daemon_spawn(self) -> int:
@@ -131,7 +135,13 @@ class TestTransientDaemonReproducer(unittest.TestCase):
 
         Returns the transient daemon's mock PID.
         """
-        from cozempic.spawn_lock import DaemonSpawnClaim, INIT_SPAWN_DAEMON
+        from cozempic.spawn_lock import DaemonSpawnClaim
+
+        # INIT_SPAWN_DAEMON is a PR #93 symbol — tolerate pre-PR-#93 base
+        try:
+            from cozempic.spawn_lock import INIT_SPAWN_DAEMON
+        except ImportError:
+            INIT_SPAWN_DAEMON = "spawn-claim-daemon"  # value from PR #93 spec
 
         transient_daemon_pid = 98765  # fake transient guard PID
 
