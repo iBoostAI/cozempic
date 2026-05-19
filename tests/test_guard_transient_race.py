@@ -685,5 +685,93 @@ class TestRaceUnderContention(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Test 8/9/10 — PR #94 review MED-1/2/3 regression: sentinel NOT written on
+# code paths that don't actually spawn the watcher (SSH, tmux/screen PID-reuse
+# early returns, _spawn_reload_watcher SSH double-check, unsupported OS).
+# Without this fix the sentinel would leak for SENTINEL_TTL_SECONDS=120s and
+# suppress legitimate SessionStart guard spawns during that window.
+# ---------------------------------------------------------------------------
+class TestSentinelNotWrittenOnEarlyReturns(unittest.TestCase):
+    """Reviewer MED-1/2/3 fold: sentinel must NOT be written on paths that
+    return without spawning a watcher (no NEW Claude → no need to suppress).
+
+    Without these tests a future refactor could re-introduce the leak class.
+    """
+
+    def setUp(self):
+        self.sid = "fedcba987654321098765432abcdef01"
+        self.sid12 = self.sid[:12]
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        self.sentinel_path.unlink(missing_ok=True)
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+
+    def test_ssh_path_does_not_write_sentinel(self):
+        """SSH (manual-resume-only) path must NOT write the sentinel."""
+        with patch("cozempic.guard._detect_terminal_env", return_value="ssh"), \
+             patch("cozempic.guard._spawn_reload_watcher"):
+            from cozempic.guard import _terminate_and_resume
+            _terminate_and_resume(
+                claude_pid=89113,
+                project_dir="/tmp/fake_project",
+                session_id=self.sid,
+            )
+        self.assertFalse(
+            self.sentinel_path.exists(),
+            f"SSH path leaked sentinel at {self.sentinel_path}. "
+            "MED-1: SSH has no auto-resume, must not suppress next SessionStart.",
+        )
+
+    def test_tmux_pid_reuse_fail_does_not_leak_sentinel(self):
+        """tmux + _is_claude_process=False early return must NOT leak sentinel."""
+        with patch("cozempic.guard._detect_terminal_env", return_value="tmux"), \
+             patch("cozempic.guard._is_claude_process", return_value=False), \
+             patch("cozempic.guard._spawn_reload_watcher"):
+            from cozempic.guard import _terminate_and_resume
+            _terminate_and_resume(
+                claude_pid=89113,
+                project_dir="/tmp/fake_project",
+                session_id=self.sid,
+            )
+        self.assertFalse(
+            self.sentinel_path.exists(),
+            f"tmux PID-reuse early-return leaked sentinel. "
+            "MED-2: no termination happened, no NEW Claude, must not suppress.",
+        )
+
+    def test_screen_pid_reuse_fail_does_not_leak_sentinel(self):
+        """screen + _is_claude_process=False early return must NOT leak sentinel."""
+        with patch("cozempic.guard._detect_terminal_env", return_value="screen"), \
+             patch("cozempic.guard._is_claude_process", return_value=False), \
+             patch("cozempic.guard._spawn_reload_watcher"):
+            from cozempic.guard import _terminate_and_resume
+            _terminate_and_resume(
+                claude_pid=89113,
+                project_dir="/tmp/fake_project",
+                session_id=self.sid,
+            )
+        self.assertFalse(
+            self.sentinel_path.exists(),
+            f"screen PID-reuse early-return leaked sentinel. "
+            "MED-2: no termination happened, no NEW Claude, must not suppress.",
+        )
+
+    def test_spawn_reload_watcher_ssh_does_not_leak_sentinel(self):
+        """_spawn_reload_watcher second-chance SSH check (MED-3) must NOT leak."""
+        with patch("cozempic.guard.is_ssh_session", return_value=True), \
+             patch("cozempic.guard.subprocess.Popen"):
+            from cozempic.guard import _spawn_reload_watcher
+            _spawn_reload_watcher(
+                claude_pid=89113,
+                project_dir="/tmp/fake_project",
+                session_id=self.sid,
+            )
+        self.assertFalse(
+            self.sentinel_path.exists(),
+            f"_spawn_reload_watcher SSH early-return leaked sentinel. "
+            "MED-3: bash watcher never spawned, sentinel unlink never fires, leak class.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

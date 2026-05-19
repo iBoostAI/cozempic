@@ -1264,15 +1264,11 @@ def _terminate_and_resume(
     term_env = _detect_terminal_env()
     system = platform.system()
 
-    # Option (c): write the reload sentinel for ALL terminal paths (tmux, screen,
-    # plain) so any concurrent SessionStart hook sees it and skips the daemon
-    # spawn during the reload window. Written BEFORE any signal is sent so there
-    # is no window where OLD Claude is dying AND slot is free AND no sentinel.
-    if session_id:
-        try:
-            write_reload_sentinel(session_id, claude_pid)
-        except OSError:
-            pass  # best-effort; stale-GC clears any leaked sentinel
+    # PR #94 review MED-1/2/3 fold: sentinel is written ONLY in paths that
+    # actually terminate OLD Claude + spawn NEW Claude (tmux, screen, plain
+    # terminal post-SIGTERM via _spawn_reload_watcher). SSH paths + PID-reuse
+    # early returns do NOT write the sentinel, eliminating the 120s
+    # suppression-window UX bug surfaced by reviewer-e2e-pr94 review.
 
     if term_env == "ssh":
         print(f"  SSH session — skipping terminate+resume. Resume manually: {resume_cmd}")
@@ -1284,6 +1280,14 @@ def _terminate_and_resume(
         if not _is_claude_process(claude_pid, session_path=session_path):
             print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping tmux terminate+resume.")
             return
+        # PID check passed — we ARE going to terminate + auto-resume. Write the
+        # sentinel BEFORE send-keys so the resumed Claude's SessionStart hook
+        # sees it and skips the daemon spawn during the resume window.
+        if session_id:
+            try:
+                write_reload_sentinel(session_id, claude_pid)
+            except OSError:
+                pass  # best-effort; stale-GC clears any leaked sentinel
         pane = os.environ.get("TMUX_PANE", "")
         target = f"-t {pane}" if pane else ""
         print(f"  tmux detected — sending /exit and auto-resuming in same pane...")
@@ -1323,6 +1327,12 @@ def _terminate_and_resume(
         if not _is_claude_process(claude_pid, session_path=session_path):
             print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping screen terminate+resume.")
             return
+        # PID check passed — write the sentinel before send-keys (see tmux block).
+        if session_id:
+            try:
+                write_reload_sentinel(session_id, claude_pid)
+            except OSError:
+                pass
         screen_session = os.environ.get("STY", "")
         print(f"  screen detected — sending /exit and auto-resuming...")
 
@@ -1376,6 +1386,16 @@ def _terminate_and_resume(
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+    # Plain-terminal path: write sentinel here, JUST BEFORE the watcher Popen.
+    # SSH and PID-reuse-fail blocks above return without reaching this point,
+    # so they leave no sentinel. The watcher script will unlink the sentinel
+    # after osascript fires (NEW Claude SessionStart can spawn freely).
+    if session_id:
+        try:
+            write_reload_sentinel(session_id, claude_pid)
+        except OSError:
+            pass  # best-effort; stale-GC clears any leaked sentinel
+
     _spawn_reload_watcher(claude_pid, project_dir, session_id=session_id)
 
 
@@ -1394,10 +1414,20 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
     if original_flags:
         resume_flag = f"{original_flags} {resume_flag}"
 
-    # SSH sessions can't open GUI terminals — skip auto-resume
+    # SSH sessions can't open GUI terminals — skip auto-resume.
+    # PR #94 review MED-3: the upstream _terminate_and_resume already wrote
+    # the sentinel for the plain-terminal path before calling us. If we early
+    # return here (double-SSH-disagree edge: _detect_terminal_env said NOT ssh
+    # but is_ssh_session() says yes), the watcher will never fire its unlink.
+    # Clean up the sentinel here so the user's manual re-resume isn't suppressed.
     if is_ssh_session():
         print(f"  SSH session detected — skipping auto-resume.")
         print(f"  Resume manually: cd {project_dir} && claude {resume_flag}")
+        if session_id:
+            try:
+                unlink_reload_sentinel(session_id)
+            except OSError:
+                pass
         return
 
     system = platform.system()
@@ -1447,6 +1477,13 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
         log_dir = escaped_dir
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")
+        # MED-3 fold: upstream wrote sentinel for plain path before calling us.
+        # Unsupported OS = no watcher spawn = no unlink fire. Clean up here.
+        if session_id:
+            try:
+                unlink_reload_sentinel(session_id)
+            except OSError:
+                pass
         return
 
     # Compose the sentinel unlink fragment (empty string when no session_id)
