@@ -220,6 +220,9 @@ class TestWatcherUnlinksSentinelAfterOsascript(unittest.TestCase):
         fake_old_pid = os.getpid()  # use ourselves (alive), test will manipulate script
 
         scripts_run = []
+        # Save the real Popen BEFORE the patch replaces it; _fake_popen uses it
+        # to run the patched script synchronously without hitting the mock recursively.
+        _real_popen = subprocess.Popen
 
         def _fake_popen(cmd_parts, **kwargs):
             # Actually run the watcher script, but synchronously so we can inspect
@@ -227,19 +230,32 @@ class TestWatcherUnlinksSentinelAfterOsascript(unittest.TestCase):
             if cmd_parts[0] == "bash" and cmd_parts[1] == "-c":
                 script = cmd_parts[2]
                 # Munge the script: replace `while kill -0 <pid>` with `true` (skip wait)
-                # and replace the resume_cmd with `true` so osascript doesn't actually run
+                # and replace the resume_cmd with `true` so osascript doesn't actually run.
+                # Also shorten the poll deadline to 2s (default is 30s — too slow for tests)
+                # and replace pgrep with empty output so status file write is exercised.
                 import re
                 patched = re.sub(r"while kill -0 \d+ 2>/dev/null; do sleep 1; done", "true", script)
-                patched = re.sub(r"osascript[^\n;]+", "true", patched)
-                patched = re.sub(r"gnome-terminal[^\n;]+", "true", patched)
-                scripts_run.append(patched)
-                # Run synchronously in a shell to test sentinel unlink
-                result = subprocess.run(
-                    ["bash", "-c", patched],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
+                patched = re.sub(r"osascript[^;]+", "true", patched)
+                patched = re.sub(r"gnome-terminal[^;]+", "true", patched)
+                patched = re.sub(
+                    r"deadline=[^;]+;",
+                    "deadline=$(($(date +%s) + 2));",
+                    patched,
                 )
+                patched = re.sub(
+                    r"pgrep -f '[^']*' 2>/dev/null [|] head -n 1",
+                    "echo ''",
+                    patched,
+                )
+                scripts_run.append(patched)
+                # Run synchronously using the real Popen (not the mock) to avoid recursion
+                with _real_popen(
+                    ["bash", "-c", patched],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ) as proc:
+                    proc.communicate(timeout=10)
                 return MagicMock(pid=99999)
             return MagicMock(pid=99999)
 
@@ -451,30 +467,38 @@ class TestReproducer86cb258bNoTransientUnprotectedState(unittest.TestCase):
         return transient_pid
 
     def test_86cb258b_reproducer_no_transient_unprotected_state(self):
-        """Reproduce the race: NEW Claude's SessionStart is blocked by transient daemon.
+        """Verify Phase B sentinel fix: NEW Claude's SessionStart is NOT blocked
+        when the reload sentinel is present.
 
-        On CURRENT CODE (no sentinel fix): DaemonAlreadyStarting raised →
-        NEW Claude unprotected. Test CONFIRMS the bug by asserting this happens.
+        Phase B fix: _terminate_and_resume writes a sentinel BEFORE spawning
+        the watcher. When the sentinel is present, start_guard_daemon returns
+        {started: False, reason: 'reload in flight', already_running: False}
+        instead of {already_running: True} — NEW Claude is PROTECTED.
 
-        On FIXED CODE (Phase B): sentinel suppresses transient claim →
-        NEW Claude gets a fresh guard. Test CONFIRMS the fix.
-
-        RED = bug confirmed (current behavior — architect hypothesis CONFIRMED).
-        GREEN = bug fixed (after Phase B).
+        GREEN = fix verified (Phase B sentinel check active).
         """
-        from cozempic.spawn_lock import DaemonAlreadyStarting
+        try:
+            from cozempic.reload_lock import write_reload_sentinel
+        except ImportError:
+            self.fail(
+                "write_reload_sentinel missing from reload_lock — Phase B not applied. "
+                "Expected RED until Phase B implementation lands."
+            )
 
-        # Step 1: Simulate OLD daemon exiting (slot freed, but in current code
-        # there is NO sentinel — that's the bug)
-        # In current code, _terminate_and_resume does NOT write a sentinel.
-        # The slot is free at this moment.
+        # Step 1: Write sentinel (simulates what _terminate_and_resume now does
+        # with Phase B before spawning the reload watcher)
+        write_reload_sentinel(self.sid, self.old_claude_pid)
+        self.assertTrue(
+            self.sentinel_path.exists(),
+            "Sentinel not created — write_reload_sentinel failed.",
+        )
 
         # Step 2: Transient daemon claims the slot (upgrade-chain re-fire)
         transient_pid = self._simulate_transient_daemon_spawn()
-        # Verify transient daemon is "alive" (we'll mock _is_process_alive to return True)
 
         # Step 3: NEW Claude's SessionStart calls start_guard_daemon
-        # Expect: DaemonAlreadyStarting raised because transient daemon holds the slot
+        # Expect: sentinel detected → returns {reason: 'reload in flight'},
+        # NOT {already_running: True} which would mean NEW Claude is UNPROTECTED.
         from cozempic.guard import start_guard_daemon
 
         spawn_calls = []
@@ -498,31 +522,25 @@ class TestReproducer86cb258bNoTransientUnprotectedState(unittest.TestCase):
                 claude_pid=self.new_claude_pid,
             )
 
-        # On CURRENT CODE (no sentinel): NEW Claude gets already_running=True
-        # This CONFIRMS the architect's hypothesis: NEW Claude UNPROTECTED.
-        if result.get("started") and not result.get("already_running"):
-            # Phase B is active — sentinel prevented the race. Test goes GREEN.
-            self.fail(
-                "UNEXPECTED GREEN: NEW Claude got a fresh guard. "
-                "This means Phase B is already applied. "
-                "If Phase B is NOT yet applied, this is a test logic error."
-            )
-        else:
-            # Bug confirmed: NEW Claude is UNPROTECTED (already_running=True)
-            self.assertTrue(
-                result.get("already_running"),
-                f"Expected already_running=True (bug confirmed), got: {result}. "
-                "Architect's hypothesis may need revision — inspect result carefully.",
-            )
-            # This RED confirms: architect's hypothesis is CORRECT.
-            # NEW Claude's SessionStart was blocked by the transient daemon.
-            # Raising explicitly so this surfaces as a RED test confirming the bug.
-            self.fail(
-                "HYPOTHESIS CONFIRMED (RED as expected): "
-                "NEW Claude ended up UNPROTECTED — DaemonAlreadyStarting / already_running "
-                f"returned True. Transient daemon (PID {transient_pid}) blocked fresh spawn. "
-                "This is exactly the 86cb258b race. Phase B will fix this."
-            )
+        # Phase B fix: sentinel suppresses transient daemon check entirely.
+        # Result must be {started: False, reason: 'reload in flight', already_running: False}.
+        self.assertEqual(
+            result.get("reason"),
+            "reload in flight",
+            f"Phase B sentinel fix not active: start_guard_daemon did not return "
+            f"'reload in flight'. Got: {result}. "
+            f"Transient daemon PID: {transient_pid}. "
+            f"Sentinel exists: {self.sentinel_path.exists()}",
+        )
+        self.assertFalse(
+            result.get("already_running"),
+            f"already_running=True despite sentinel — Phase B sentinel check must "
+            f"run BEFORE the transient daemon check. Got: {result}",
+        )
+        self.assertFalse(
+            result.get("started"),
+            f"started=True unexpected (sentinel should suppress spawn). Got: {result}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +569,12 @@ class TestRaceUnderContention(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.tmpdir, True)
 
     def _run_start_guard_daemon(self, with_sentinel: bool, results: list, idx: int):
-        """Worker: attempt start_guard_daemon; record result."""
+        """Worker: attempt start_guard_daemon; record result.
+
+        NOTE: patches are applied at the test level (not per-thread) to avoid
+        non-thread-safe patch restoration leaking across test boundaries.
+        The worker simply calls start_guard_daemon with the already-mocked environment.
+        """
         try:
             if with_sentinel:
                 # Ensure sentinel is present (may already be)
@@ -560,21 +583,7 @@ class TestRaceUnderContention(unittest.TestCase):
                         f"89113\n{__import__('datetime').datetime.now().isoformat()}\n"
                     )
             from cozempic.guard import start_guard_daemon
-            from unittest.mock import patch, MagicMock
-            from pathlib import Path
-
-            def _fake_popen(cmd_parts, **kwargs):
-                return MagicMock(pid=90000 + idx)
-
-            with patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen), \
-                 patch("cozempic.guard.find_claude_pid", return_value=94466), \
-                 patch("cozempic.guard.find_current_session", return_value={
-                     "session_id": self.sid,
-                     "path": Path("/tmp/fake.jsonl"),
-                 }), \
-                 patch("cozempic.guard._cleanup_legacy_pid"), \
-                 patch("cozempic.guard.maybe_auto_update", return_value=False):
-                result = start_guard_daemon(session_id=self.sid, claude_pid=94466)
+            result = start_guard_daemon(session_id=self.sid, claude_pid=94466)
             results.append({"idx": idx, "with_sentinel": with_sentinel, "result": result})
         except Exception as exc:
             results.append({"idx": idx, "with_sentinel": with_sentinel, "error": str(exc)})
@@ -626,17 +635,33 @@ class TestRaceUnderContention(unittest.TestCase):
             barrier.wait(timeout=5)
             self._run_start_guard_daemon(with_sentinel, results, idx)
 
-        for i in range(5):
-            t = threading.Thread(target=_worker, args=(True, i), daemon=True)
-            threads.append(t)
-        for i in range(5, 10):
-            t = threading.Thread(target=_worker, args=(False, i), daemon=True)
-            threads.append(t)
+        # Apply patches at the TEST level (single-threaded) before spawning workers.
+        # Per-thread patch/unpatch is NOT thread-safe in unittest.mock and leaks mocks
+        # across test boundaries. Applying once here is safe and correct.
+        def _fake_popen(cmd_parts, **kwargs):
+            return MagicMock(pid=90001)
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=15)
+        with patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen), \
+             patch("cozempic.guard.find_claude_pid", return_value=94466), \
+             patch("cozempic.guard.find_current_session", return_value={
+                 "session_id": self.sid,
+                 "path": Path("/tmp/fake.jsonl"),
+             }), \
+             patch("cozempic.guard._cleanup_legacy_pid"), \
+             patch("cozempic.guard.maybe_auto_update", return_value=False):
+
+            for i in range(5):
+                t = threading.Thread(target=_worker, args=(True, i), daemon=True)
+                threads.append(t)
+            for i in range(5, 10):
+                t = threading.Thread(target=_worker, args=(False, i), daemon=True)
+                threads.append(t)
+
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+            # Patches are restored here (after all threads complete)
 
         sentinel_started = [r["result"].get("started") for r in results
                            if not r.get("error") and r["with_sentinel"]]

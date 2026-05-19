@@ -50,6 +50,20 @@ INIT_GUARD_HARD1 = "guard-hard1"
 INIT_GUARD_HARD2 = "guard-hard2"
 INIT_OVERFLOW = "overflow"
 
+# Sentinel constants — guard the reload window to prevent transient-daemon races.
+#
+# The sentinel file lives at {tempfile.gettempdir()}/cozempic_reload_<slug>.in-flight
+# and is written by _terminate_and_resume BEFORE spawning the watcher, so any
+# concurrent SessionStart hook (upgrade-chain re-fire, parallel Tab) that calls
+# start_guard_daemon sees the sentinel and skips the spawn.
+#
+# SENTINEL_TTL_SECONDS is longer than WEDGE_TTL_SECONDS (60s) because it guards
+# the full reload chain: SIGTERM → watcher detach → osascript → Terminal startup
+# → claude -r auth. The watcher unlinks it after osascript fires (async unlink),
+# so the TTL is a safety net for the watcher-SIGKILL scenario only.
+SENTINEL_TTL_SECONDS = 120
+INIT_RELOAD_SENTINEL = "reload-sentinel"
+
 # Session ID sanitization — matches _pid_file_for_session in guard.py.
 # UUIDs are hex+dashes (32 chars + 4 dashes), but session_id can be passed
 # as a path (e.g. from $TRANSCRIPT) which we normalize. Strip to first 12
@@ -304,3 +318,181 @@ def acquire_with_wait(
                 )
                 notified = True
             time.sleep(poll_interval)
+
+
+# ── Reload sentinel (NEW-1 option c) ─────────────────────────────────────────
+#
+# Complements the reload lock: the lock prevents CONCURRENT reloads (two callers
+# racing to spawn a watcher). The sentinel prevents a TRANSIENT guard daemon from
+# spawning in the gap between:
+#   1. OLD guard's finally-block unlink (slot is FREE)
+#   2. NEW Claude's SessionStart spawning the real replacement guard
+#
+# The sentinel is written by _terminate_and_resume BEFORE spawning the watcher,
+# and unlinked by the watcher bash script AFTER osascript fires. Both the bash
+# fast-path in hooks.json AND the Python start_guard_daemon path check it.
+# _________________________________________________________________________
+
+
+def _reload_sentinel_path_for(session_id: str) -> Path:
+    """Return the sentinel file path for a session.
+
+    Uses /tmp directly (same as _pid_file_for_session in guard.py and as the
+    bash hook scripts) for cross-process consistency. tempfile.gettempdir()
+    resolves to /var/folders/... on macOS which differs from the /tmp symlink
+    that bash scripts use — both point to the same inode on macOS, but Path
+    equality checks fail. Using /tmp directly is also more readable.
+
+    Validates that the slug contains no path separators to prevent traversal.
+    """
+    slug = _slug_for(session_id)[:12]
+    # The slug comes from _slug_for which substitutes [^a-zA-Z0-9_-] with _,
+    # so it cannot contain path separators. Belt-and-suspenders check:
+    if "/" in slug or "\\" in slug:
+        raise ValueError(
+            f"sentinel slug contains path separator (session_id type "
+            f"{type(session_id).__name__}, length {len(session_id)})"
+        )
+    return Path("/tmp") / f"cozempic_reload_{slug}.in-flight"
+
+
+def _read_sentinel_metadata(sentinel_path: Path) -> tuple[int, Optional[float]]:
+    """Parse a sentinel file. Returns (claude_pid, age_sec) — best effort.
+
+    On any read/parse failure, returns (0, None) so the caller can decide
+    whether to treat as stale. Does NOT return the initiator field — callers
+    only need pid and age for GC decisions.
+    """
+    try:
+        content = sentinel_path.read_text(encoding="utf-8").strip().split("\n")
+    except OSError:
+        return 0, None
+    pid = 0
+    age = None
+    if len(content) >= 1:
+        try:
+            pid = int(content[0].strip())
+        except ValueError:
+            pass
+    if len(content) >= 2:
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(content[1].strip())
+            age = max(0.0, time.time() - ts.timestamp())
+        except (ValueError, IndexError):
+            pass
+    return pid, age
+
+
+def write_reload_sentinel(session_id: str, claude_pid: int) -> Path:
+    """Write a reload sentinel for session_id, recording claude_pid.
+
+    Uses O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW for atomic creation (same
+    pattern as _ReloadLock._try_create). If the sentinel already exists
+    from a prior leaked reload cycle, unlinks it and retries ONCE.
+
+    Returns the sentinel path.
+    Raises OSError on persistent failure (after the retry). Callers should
+    wrap in try/except OSError and treat failure as "no sentinel" (degrades
+    gracefully: the race window remains but the system doesn't crash).
+    """
+    from datetime import datetime
+
+    sentinel_path = _reload_sentinel_path_for(session_id)
+    payload = (
+        f"{claude_pid}\n"
+        f"{datetime.now().isoformat(timespec='seconds')}\n"
+        f"{INIT_RELOAD_SENTINEL}\n"
+    ).encode("utf-8")
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    for attempt in range(2):
+        try:
+            fd = os.open(str(sentinel_path), flags, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            return sentinel_path
+        except FileExistsError:
+            if attempt == 0:
+                # Stale sentinel from a prior reload cycle that leaked.
+                # Unlink and retry once — same pattern as _ReloadLock._acquire.
+                try:
+                    sentinel_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                # loop continues for attempt == 1
+            else:
+                # Retry also failed (another process won the race — their
+                # sentinel is valid). Re-raise so the outer try/except decides.
+                raise
+        except OSError:
+            raise
+
+    # Unreachable (loop always returns or raises), but satisfies type checker
+    return sentinel_path  # pragma: no cover
+
+
+def unlink_reload_sentinel(session_id: str) -> None:
+    """Best-effort unlink of the reload sentinel.
+
+    Called by:
+    - The watcher bash script after osascript fires (async unlink)
+    - _terminate_and_resume for the tmux/screen paths (sync unlink at end of block)
+
+    Swallows all OSError (including ENOENT). No CAS needed: the sentinel is
+    single-writer (only _terminate_and_resume creates it) and the watcher is
+    the only async unlinker. The CAS invariant is maintained by the mtime GC
+    in _reload_sentinel_active.
+    """
+    try:
+        _reload_sentinel_path_for(session_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _reload_sentinel_active(session_id: str) -> bool:
+    """Return True if a FRESH reload sentinel exists for session_id.
+
+    A sentinel is "fresh" if:
+      - The file exists AND
+      - Its filesystem mtime age is < SENTINEL_TTL_SECONDS
+
+    Uses filesystem mtime (not the ISO timestamp in the file content) for the
+    freshness check. mtime is set by the OS on write and can be overridden by
+    tests via os.utime, making it the canonical freshness signal. The content
+    timestamp is used for diagnostics only.
+
+    Side-effect on stale detection: unlinks the stale sentinel and returns
+    False. This GC behavior prevents permanently suppressed spawns when the
+    watcher was SIGKILL'd between sentinel write and sentinel unlink.
+
+    Note: this function has a write side-effect despite the interrogative name.
+    The full name would be _is_reload_sentinel_active_or_gc, but that is too
+    verbose. The docstring makes the side-effect explicit.
+    """
+    sentinel_path = _reload_sentinel_path_for(session_id)
+    if not sentinel_path.exists():
+        return False
+
+    # Use mtime for freshness — tests can manipulate it via os.utime, and it's
+    # set atomically by the OS on file write (no parse errors possible).
+    try:
+        age = time.time() - sentinel_path.stat().st_mtime
+    except OSError:
+        # File disappeared between exists() and stat() — treat as absent
+        return False
+
+    if age >= SENTINEL_TTL_SECONDS:
+        # Stale — GC it
+        try:
+            sentinel_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+    return True

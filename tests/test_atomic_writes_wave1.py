@@ -310,7 +310,7 @@ class TestHookSchemaV9(unittest.TestCase):
 
     def test_schema_marker_bumped(self):
         from cozempic.init import HOOK_SCHEMA_VERSION
-        self.assertEqual(HOOK_SCHEMA_VERSION, "v9")
+        self.assertEqual(HOOK_SCHEMA_VERSION, "v10")
 
     def test_no_unflocked_foreground_guard_daemon_call(self):
         """The unflocked foreground `cozempic guard --daemon` call stays removed.

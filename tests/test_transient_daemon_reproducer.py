@@ -198,16 +198,31 @@ class TestTransientDaemonReproducer(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_86cb258b_full_sequence_new_claude_unprotected_on_current_code(self):
-        """Reproduce the 86cb258b event sequence. Confirm bug exists on current code.
+        """Verify the Phase B fix for the 86cb258b event sequence.
 
-        This test is EXPECTED TO RED with:
-            "HYPOTHESIS CONFIRMED: NEW Claude ended up UNPROTECTED"
+        Phase B fix: _terminate_and_resume writes a reload sentinel BEFORE spawning
+        the watcher. When NEW Claude's SessionStart fires and the sentinel is present,
+        start_guard_daemon returns {reason: 'reload in flight'} instead of raising
+        DaemonAlreadyStarting — NEW Claude is PROTECTED.
 
-        If it REDs with any other message, the architect's hypothesis NEEDS REVISION.
-        If it GREENs unexpectedly, Phase B may already be applied — check.
+        GREEN = Phase B fix verified.
         """
-        # Step 1: OLD daemon exits, slot freed, no sentinel (current code bug)
+        try:
+            from cozempic.reload_lock import write_reload_sentinel
+        except ImportError:
+            self.fail(
+                "write_reload_sentinel missing from reload_lock — Phase B not applied. "
+                "Expected RED until Phase B implementation lands."
+            )
+
+        # Step 1: OLD daemon exits, slot freed — AND sentinel is written (Phase B fix)
         self._simulate_old_daemon_exits_and_slot_freed()
+        # Write sentinel: this is what _terminate_and_resume now does with Phase B
+        write_reload_sentinel(REPRO_SESSION_ID, claude_pid=OLD_CLAUDE_PID)
+        self.assertTrue(
+            _sentinel_path().exists(),
+            "Sentinel not created by write_reload_sentinel — Phase B fix not active.",
+        )
 
         # Step 2: Transient daemon claims the slot
         transient_pid = self._simulate_transient_daemon_spawn()
@@ -224,58 +239,30 @@ class TestTransientDaemonReproducer(unittest.TestCase):
             f"Transient daemon PID {transient_pid} not in pidfile. Content: {pid_content!r}",
         )
 
-        # Step 3: NEW Claude's SessionStart fires
+        # Step 3: NEW Claude's SessionStart fires — sentinel is present
         result = self._simulate_new_claude_session_start()
 
         # ------------------------------------------------------------------
-        # VERDICT
+        # VERDICT (Phase B)
         # ------------------------------------------------------------------
-        # On CURRENT CODE (no sentinel): already_running=True → NEW Claude UNPROTECTED
-        # On FIXED CODE (Phase B): started=False, reason="reload in flight"
-        #   OR started=True (sentinel expired, new guard spawned)
+        # Sentinel suppresses the transient daemon check entirely.
+        # start_guard_daemon must return {started: False, reason: 'reload in flight'}
+        # NOT {already_running: True} which means NEW Claude is UNPROTECTED.
 
-        is_already_running = result.get("already_running", False)
         is_reload_in_flight = result.get("reason") == "reload in flight"
-        is_started = result.get("started", False)
+        is_already_running = result.get("already_running", False)
 
-        if is_started and not is_already_running:
-            # This should only happen after Phase B
-            self.fail(
-                "UNEXPECTED GREEN: NEW Claude got a fresh guard daemon. "
-                "If Phase B is NOT yet applied, this indicates a test logic error. "
-                f"Result: {result}"
-            )
-
-        if is_reload_in_flight:
-            # Phase B is active — sentinel detected, spawn suppressed
-            self.fail(
-                "UNEXPECTED PHASE-B BEHAVIOR: start_guard_daemon returned "
-                "'reload in flight'. Phase B sentinel check appears to be active. "
-                "If Phase B is NOT yet applied, this is a test logic error. "
-                f"Result: {result}"
-            )
-
-        if is_already_running:
-            # This is the bug. Hypothesis CONFIRMED.
-            # Explicitly fail with the confirming message so this surfaces as RED.
-            self.fail(
-                "HYPOTHESIS CONFIRMED (RED as expected on current code): "
-                f"NEW Claude (PID {NEW_CLAUDE_PID}) ended up UNPROTECTED. "
-                f"start_guard_daemon returned already_running=True — "
-                f"transient daemon (PID {transient_pid}) for OLD Claude (PID {OLD_CLAUDE_PID}) "
-                f"blocked the fresh guard spawn. "
-                f"This is exactly the 86cb258b race (2026-05-19 14:37:21 - 14:38:29). "
-                f"Phase B sentinel fix will close this. "
-                f"Full result: {result}"
-            )
-
-        # If we reach here, neither started=True nor already_running=True nor reload-in-flight.
-        # Something unexpected happened.
-        self.fail(
-            "UNEXPECTED RESULT: neither started nor already_running nor reload-in-flight. "
-            f"Architect's hypothesis NEEDS REVISION. "
-            f"Full result: {result}. "
-            f"Transient pid file content: {_pid_path().read_text() if _pid_path().exists() else '<gone>'}"
+        self.assertTrue(
+            is_reload_in_flight,
+            f"Phase B sentinel fix not active: expected reason='reload in flight', got: {result}. "
+            f"Transient PID: {transient_pid}. "
+            f"Sentinel exists: {_sentinel_path().exists()}. "
+            f"If already_running=True, sentinel check is not running before transient-daemon check."
+        )
+        self.assertFalse(
+            is_already_running,
+            f"already_running=True despite Phase B sentinel — sentinel must suppress "
+            f"transient daemon detection. Result: {result}",
         )
 
     # ------------------------------------------------------------------

@@ -59,6 +59,9 @@ class TestWatcherWritesStatusOnNoNewClaude(unittest.TestCase):
         # _spawn_reload_watcher with mocked osascript (returns 0) and
         # mocked pgrep (never finds a claude process → empty output)
         scripts_run = []
+        # Save the real Popen BEFORE the patch replaces it so _fake_popen can
+        # run the patched bash script synchronously without hitting the mock recursively.
+        _real_popen = subprocess.Popen
 
         def _fake_popen(cmd_parts, **kwargs):
             if cmd_parts[0] == "bash" and cmd_parts[1] == "-c":
@@ -70,25 +73,29 @@ class TestWatcherWritesStatusOnNoNewClaude(unittest.TestCase):
                 # 4. Replace pgrep with a command that always returns empty
                 import re
                 patched = re.sub(r"while kill -0 \d+ 2>/dev/null; do sleep 1; done", "true", script)
-                patched = re.sub(r"osascript[^\n;]*", "true", patched)
+                patched = re.sub(r"osascript[^;]*", "true", patched)
+                # Replace the deadline line (use [$ ] char class to match literal $;
+                # \$ in Python regex is the end-of-string anchor, not a literal dollar)
                 patched = re.sub(
-                    r"deadline=\$\(\(.*?\)\)",
-                    "deadline=$(($(date +%s) + 2))",  # 2s poll window for speed
+                    r"deadline=[^;]+;",
+                    "deadline=$(($(date +%s) + 2));",  # 2s poll window for speed
                     patched,
                 )
+                # Replace pgrep (| is regex alternation — escape with \|; use [|] to match literal pipe)
                 patched = re.sub(
-                    r"pgrep -f[^\n]*",
+                    r"pgrep -f '[^']*' 2>/dev/null [|] head -n 1",
                     "echo ''",  # always empty — no claude found
                     patched,
                 )
                 scripts_run.append(patched)
-                # Run the script synchronously so we can check the status file
-                subprocess.run(
+                # Run the script synchronously using the real Popen to avoid recursion
+                with _real_popen(
                     ["bash", "-c", patched],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=15,
-                )
+                ) as proc:
+                    proc.communicate(timeout=15)
                 return MagicMock(pid=99999)
             return MagicMock(pid=99999)
 
@@ -152,6 +159,8 @@ class TestWatcherLogsSuccessWhenNewClaudeAppears(unittest.TestCase):
         guard_log = Path("/tmp/cozempic_guard.log")
 
         scripts_run = []
+        # Save the real Popen BEFORE the patch to avoid mock recursion in _fake_popen
+        _real_popen = subprocess.Popen
 
         def _fake_popen(cmd_parts, **kwargs):
             if cmd_parts[0] == "bash" and cmd_parts[1] == "-c":
@@ -159,26 +168,27 @@ class TestWatcherLogsSuccessWhenNewClaudeAppears(unittest.TestCase):
                 import re
                 # Skip wait loop, replace osascript with true
                 patched = re.sub(r"while kill -0 \d+ 2>/dev/null; do sleep 1; done", "true", script)
-                patched = re.sub(r"osascript[^\n;]*", "true", patched)
-                # Short deadline (2s) for test speed
+                patched = re.sub(r"osascript[^;]*", "true", patched)
+                # Short deadline (5s) for test speed
                 patched = re.sub(
-                    r"deadline=\$\(\(.*?\)\)",
-                    "deadline=$(($(date +%s) + 5))",
+                    r"deadline=[^;]+;",
+                    "deadline=$(($(date +%s) + 5));",
                     patched,
                 )
                 # Replace pgrep with one that returns a fake PID immediately
                 patched = re.sub(
-                    r"pgrep -f[^\n]*",
+                    r"pgrep -f '[^']*' 2>/dev/null [|] head -n 1",
                     f"echo '{fake_new_pid}'",
                     patched,
                 )
                 scripts_run.append(patched)
-                subprocess.run(
+                with _real_popen(
                     ["bash", "-c", patched],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=15,
-                )
+                ) as proc:
+                    proc.communicate(timeout=15)
                 return MagicMock(pid=99999)
             return MagicMock(pid=99999)
 
@@ -234,6 +244,8 @@ class TestWatcherHandlesResumeCmdNonzeroExit(unittest.TestCase):
             )
 
         scripts_run = []
+        # Save the real Popen BEFORE the patch to avoid mock recursion in _fake_popen
+        _real_popen = subprocess.Popen
 
         def _fake_popen(cmd_parts, **kwargs):
             if cmd_parts[0] == "bash" and cmd_parts[1] == "-c":
@@ -241,20 +253,21 @@ class TestWatcherHandlesResumeCmdNonzeroExit(unittest.TestCase):
                 import re
                 patched = re.sub(r"while kill -0 \d+ 2>/dev/null; do sleep 1; done", "true", script)
                 # osascript exits 1 — simulate automation permission denied
-                patched = re.sub(r"osascript[^\n;]*", "false", patched)
+                patched = re.sub(r"osascript[^;]*", "false", patched)
                 patched = re.sub(
-                    r"deadline=\$\(\(.*?\)\)",
-                    "deadline=$(($(date +%s) + 2))",
+                    r"deadline=[^;]+;",
+                    "deadline=$(($(date +%s) + 2));",
                     patched,
                 )
-                patched = re.sub(r"pgrep -f[^\n]*", "echo ''", patched)
+                patched = re.sub(r"pgrep -f '[^']*' 2>/dev/null [|] head -n 1", "echo ''", patched)
                 scripts_run.append(patched)
-                subprocess.run(
+                with _real_popen(
                     ["bash", "-c", patched],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=15,
-                )
+                ) as proc:
+                    proc.communicate(timeout=15)
                 return MagicMock(pid=99999)
             return MagicMock(pid=99999)
 
@@ -325,7 +338,8 @@ class TestSessionStartHookSurfacesPriorStatus(unittest.TestCase):
         hook_data = _json.dumps({"session_id": self.sid, "transcript_path": ""})
         env = os.environ.copy()
         result = subprocess.run(
-            ["bash", "-c", f"echo '{hook_data}' | {cmd}"],
+            ["bash", "-c", cmd],
+            input=hook_data,
             capture_output=True,
             text=True,
             env=env,
