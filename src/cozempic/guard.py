@@ -22,6 +22,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1322,6 +1323,23 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
 _SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{11,}$")
 
 
+def _guard_tmp_root() -> Path:
+    """Directory for guard PID/log files.
+
+    POSIX keeps the historical ``/tmp`` so the path stays byte-identical to the
+    SessionStart shell hook (which hardcodes ``/tmp/cozempic_guard_*.pid`` and
+    cannot call ``tempfile.gettempdir()``); diverging would make the hook's
+    "guard already running" fast-path always miss on macOS, where gettempdir()
+    is ``/var/folders/.../T``. Windows has no ``/tmp`` — a literal
+    ``Path("/tmp")`` resolves to ``C:\\tmp`` which is not guaranteed to exist,
+    raising FileNotFoundError during daemon spawn — so use the platform tempdir
+    there.
+    """
+    if os.name == "nt":
+        return Path(tempfile.gettempdir())
+    return Path("/tmp")
+
+
 def _pid_file_for_session(session_id: str) -> Path:
     """Return the PID file path for a guard daemon watching a specific session.
 
@@ -1343,14 +1361,14 @@ def _pid_file_for_session(session_id: str) -> Path:
             f"session_id must be alphanumeric+_- (leading-alphanumeric, >=12 chars), "
             f"got {type(session_id).__name__} of length {len(session_id)}"
         )
-    return Path("/tmp") / f"cozempic_guard_{session_id[:12]}.pid"
+    return _guard_tmp_root() / f"cozempic_guard_{session_id[:12]}.pid"
 
 
 def _pid_file_for_cwd(cwd: str) -> Path:
     """Legacy: PID file keyed by CWD hash. Used for migration cleanup only."""
     import hashlib
     slug = hashlib.md5(cwd.encode()).hexdigest()[:12]
-    return Path("/tmp") / f"cozempic_guard_{slug}.pid"
+    return _guard_tmp_root() / f"cozempic_guard_{slug}.pid"
 
 
 def _cleanup_legacy_pid(cwd: str) -> None:
@@ -1485,6 +1503,23 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
         if age >= _FRESH_PIDFILE_SECONDS:
             pid_path.unlink(missing_ok=True)
         return None
+    except OSError:
+        # Windows: os.kill(pid, 0) raises a bare OSError [WinError 87]
+        # (invalid parameter) for a non-existent PID instead of the POSIX
+        # ProcessLookupError caught above. Treat it as a dead PID, reusing the
+        # same freshness-aware unlink so we don't destroy a peer's just-written
+        # claim. Re-raise on POSIX, where a bare OSError here is unexpected and
+        # must not be silently masked.
+        if os.name != "nt":
+            raise
+        from .spawn_lock import _FRESH_PIDFILE_SECONDS
+        try:
+            age = time.time() - pid_path.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age >= _FRESH_PIDFILE_SECONDS:
+            pid_path.unlink(missing_ok=True)
+        return None
 
 
 # Backward compat aliases
@@ -1598,8 +1633,8 @@ def start_guard_daemon(
     else:
         import hashlib
         pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
-        log_file = Path("/tmp") / f"cozempic_guard_{pid_key}.log"
-        pid_path = Path("/tmp") / f"cozempic_guard_{pid_key}.pid"
+        log_file = _guard_tmp_root() / f"cozempic_guard_{pid_key}.log"
+        pid_path = _guard_tmp_root() / f"cozempic_guard_{pid_key}.pid"
 
     if claude_pid is None:
         claude_pid = find_claude_pid()
@@ -1686,15 +1721,28 @@ def start_guard_daemon(
                 # PYTHONUNBUFFERED=1 ensures guard log output is written immediately (#14)
                 env = os.environ.copy()
                 env["PYTHONUNBUFFERED"] = "1"
-                proc = subprocess.Popen(
-                    cmd_parts,
-                    stdout=lf,
-                    stderr=lf,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                    cwd=cwd,
-                    env=env,
-                )
+                # Detach the child so it outlives the parent. start_new_session
+                # is POSIX-only — on Windows it raises OSError [WinError 87]
+                # (invalid parameter), especially when the parent's stdio
+                # handles aren't inheritable (spawned under wscript -> hidden
+                # powershell -> Start-Process). Use the Windows creationflags
+                # equivalents there.
+                popen_kwargs = {
+                    "stdout": lf,
+                    "stderr": lf,
+                    "stdin": subprocess.DEVNULL,
+                    "cwd": cwd,
+                    "env": env,
+                }
+                if os.name == "nt":
+                    popen_kwargs["creationflags"] = (
+                        subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_NEW_PROCESS_GROUP
+                        | subprocess.CREATE_NO_WINDOW
+                    )
+                else:
+                    popen_kwargs["start_new_session"] = True
+                proc = subprocess.Popen(cmd_parts, **popen_kwargs)
             finally:
                 lf.close()
 

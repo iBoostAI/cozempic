@@ -797,11 +797,17 @@ def cmd_guard(args):
             session_id=session_id,
             claude_pid=claude_pid,
         )
-        if result["already_running"]:
-            print(f"  Guard already running (PID {result['pid']})")
-        elif result["started"]:
-            print(f"  Guard daemon started (PID {result['pid']})")
-            print(f"  Log: {result['log_file']}")
+        # Defensive .get() so a future regression that drops a key from
+        # start_guard_daemon's return dict surfaces as a readable message
+        # instead of an opaque KeyError traceback.
+        if result.get("already_running"):
+            print(f"  Guard already running (PID {result.get('pid')})")
+        elif result.get("started"):
+            print(f"  Guard daemon started (PID {result.get('pid')})")
+            print(f"  Log: {result.get('log_file')}")
+        else:
+            reason = result.get("reason") or "unknown (no started/already_running/reason set)"
+            print(f"  Guard daemon failed to start: {reason}")
         return
 
     start_guard(
