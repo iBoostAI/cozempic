@@ -262,7 +262,15 @@ class OverflowRecovery:
             from .reload_lock import _ReloadLock, ReloadLockHeld, INIT_OVERFLOW
             try:
                 with _ReloadLock(self.session_id, initiator=INIT_OVERFLOW):
-                    _terminate_and_resume(claude_pid, self.cwd, session_id=self.session_id)
+                    # Pass session_path so the identity check's forked-Claude
+                    # mtime fallback works (happy-path symmetry with
+                    # guard_prune_cycle). The bare-liveness gate in
+                    # _terminate_and_resume still prevents resurrection.
+                    _terminate_and_resume(
+                        claude_pid, self.cwd,
+                        session_id=self.session_id,
+                        session_path=self.session_path,
+                    )
                     print(
                         f"  [{now}] Kill + resume triggered (PID {claude_pid}). "
                         f"~10s downtime.",

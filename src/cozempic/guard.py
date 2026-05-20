@@ -1274,16 +1274,22 @@ def _terminate_and_resume(
         print(f"  SSH session — skipping terminate+resume. Resume manually: {resume_cmd}")
         return
 
-    # Anti-resurrection + PID-reuse entry gate (restored from pre-#94 behaviour).
-    # If Claude is already gone at entry — e.g. the user exited during the prune
-    # window between the guard's liveness check and this call — do NOT proceed.
-    # The reload watcher resumes UNCONDITIONALLY once claude_pid dies
-    # (`while kill -0 …; do sleep; done; <resume_cmd>`), so entering here with a
-    # dead PID would reopen a session the user intentionally closed — the exact
-    # class of the cozempic reload incidents. The per-block checks below only
-    # guard each SIGTERM/SIGKILL, NOT the watcher spawn, so this entry gate is
-    # required for correctness. It also returns before any sentinel write,
+    # Anti-resurrection entry gate. The reload watcher resumes UNCONDITIONALLY
+    # once claude_pid dies (`while kill -0 …; do sleep; done; <resume_cmd>`), so
+    # entering here with an already-dead Claude — e.g. the user exited during
+    # the prune window — would reopen a session the user closed. The per-block
+    # checks below only guard each SIGTERM/SIGKILL, NOT the watcher spawn, so
+    # this gate is load-bearing. It returns before any sentinel write too,
     # consistent with "sentinel only on paths that actually terminate+resume."
+    #
+    # Liveness FIRST, and mtime-IMMUNE: guard_prune_cycle's own save_messages
+    # refreshes the JSONL mtime moments before this call, so _is_claude_process's
+    # mtime fallback can misreport a dead Claude as alive. os.kill is not fooled.
+    if not _pid_is_alive(claude_pid):
+        print(f"  PID {claude_pid} is gone — skipping terminate+resume (no resurrection).")
+        return
+    # Identity (anti-PID-reuse): is this still actually Claude, not a recycled
+    # PID? Per-block checks re-verify before each kill; this is the fail-fast.
     if not _is_claude_process(claude_pid, session_path=session_path):
         print(f"  PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
         return
@@ -2158,6 +2164,31 @@ def _is_cozempic_guard_process(pid: int) -> bool:
 
 
 _MTIME_LIVENESS_WINDOW_SEC = 60
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Bare process-liveness probe — does NOT consult the JSONL mtime.
+
+    Anti-resurrection: a dead PID must read as dead even when cozempic's own
+    ``save_messages`` just refreshed the session JSONL moments earlier.
+    ``_is_claude_process``'s mtime fallback would misread that fresh write as a
+    live Claude and let the reload watcher resurrect a session the user closed.
+    ``os.kill(pid, 0)`` answers liveness directly and is not fooled by it.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, owned by another user
+    except OSError:
+        # Windows raises OSError [WinError 87] for a non-existent PID; treat any
+        # Windows os.kill failure as "gone". On POSIX an unexpected OSError here
+        # is rare — assume alive so we never skip a legitimate reload.
+        return os.name != "nt"
 
 
 def _is_claude_process(pid: int, session_path: Path | None = None) -> bool:

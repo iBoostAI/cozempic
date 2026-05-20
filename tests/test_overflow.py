@@ -234,7 +234,11 @@ class TestOverflowDetection(unittest.TestCase):
             ):
                 recovery.recover()
 
-            mock_reload.assert_called_once_with(7777, self.tmpdir, session_id="test-explicit-pid")
+            mock_reload.assert_called_once_with(
+                7777, self.tmpdir,
+                session_id="test-explicit-pid",
+                session_path=self.session_path,
+            )
         finally:
             breaker.reset()
 

@@ -131,11 +131,12 @@ class TestNoResurrectionWhenClaudeAlreadyDead(unittest.TestCase):
 
     def test_dead_claude_at_entry_skips_sentinel_and_watcher(self):
         sid = "ddddddddeeee1111222233334444dddd"
+        # Simulate a dead PID at the bare-liveness probe: os.kill(pid, 0) raises
+        # ProcessLookupError. The gate must return before any sentinel/watcher.
         with patch("cozempic.guard._spawn_reload_watcher") as mock_watcher, \
              patch("cozempic.guard.write_reload_sentinel") as mock_sentinel, \
-             patch("cozempic.guard._is_claude_process", return_value=False), \
              patch("cozempic.guard._detect_terminal_env", return_value="plain"), \
-             patch("cozempic.guard.os.kill") as mock_kill:
+             patch("cozempic.guard.os.kill", side_effect=ProcessLookupError):
             from cozempic.guard import _terminate_and_resume
             _terminate_and_resume(
                 claude_pid=99999,
@@ -144,7 +145,43 @@ class TestNoResurrectionWhenClaudeAlreadyDead(unittest.TestCase):
             )
         mock_watcher.assert_not_called()   # no resurrection
         mock_sentinel.assert_not_called()  # no stale sentinel suppressing legit spawns
-        mock_kill.assert_not_called()      # no signal to a dead/recycled PID
+
+
+class TestNoResurrectionDespiteFreshJSONLMtime(unittest.TestCase):
+    """Mtime-immune liveness gate. A Claude that died during the prune window
+    must NOT be resurrected even though cozempic's own save_messages just
+    refreshed the session JSONL — which `_is_claude_process`'s mtime fallback
+    misreads as a live Claude. Drives the REAL `_is_claude_process` (only the
+    resume watcher is mocked), so it exercises the actual invariant rather than
+    mocking away the very fallback that produced the false-alive verdict.
+    """
+
+    def test_dead_pid_with_fresh_jsonl_does_not_resurrect(self):
+        # A definitively-dead PID: spawn a trivial process and reap it.
+        proc = subprocess.Popen([sys.executable, "-c", ""])
+        proc.wait()
+        dead_pid = proc.pid
+
+        with tempfile.TemporaryDirectory() as td:
+            jsonl = Path(td) / "session.jsonl"
+            jsonl.write_text("{}\n")  # mtime = now — mimics save_messages' fresh write
+            sid = "ddddddddffff1111222233334444dddd"
+            sentinel = Path(f"/tmp/cozempic_reload_{sid[:12]}.in-flight")
+            sentinel.unlink(missing_ok=True)
+            self.addCleanup(sentinel.unlink, missing_ok=True)
+
+            from cozempic.guard import _terminate_and_resume, _is_claude_process
+            # Precondition: the mtime fallback WOULD misreport this dead PID as a
+            # live Claude — proving the gate cannot rely on _is_claude_process.
+            self.assertTrue(
+                _is_claude_process(dead_pid, session_path=jsonl),
+                "precondition: mtime fallback should report the dead PID alive",
+            )
+            with patch("cozempic.guard._spawn_reload_watcher") as mock_watcher, \
+                 patch("cozempic.guard._detect_terminal_env", return_value="plain"):
+                _terminate_and_resume(dead_pid, td, session_id=sid, session_path=jsonl)
+            mock_watcher.assert_not_called()  # bare-liveness gate beat the mtime fallback
+            self.assertFalse(sentinel.exists())
 
 
 # ---------------------------------------------------------------------------
