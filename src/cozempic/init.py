@@ -227,31 +227,56 @@ class _SettingsLock:
     run a first-init concurrently, or when SessionStart hooks fire for two
     sessions simultaneously) from clobbering each other's additions.
 
-    Best-effort on platforms without fcntl (Windows): degrades to a no-op
-    context manager so we don't crash, we just lose the concurrency guarantee.
+    Cross-platform: POSIX uses fcntl.lockf (chosen over flock for NFS
+    reliability — flock silent-no-ops on NFSv3), Windows uses
+    msvcrt.locking on the first byte of the lock file (same per-byte
+    semantics, sibling pattern to _HostFileLock in helpers.py). Falls
+    back to no-op on platforms missing both fcntl AND msvcrt.
     """
     def __init__(self, settings_path: Path):
         self.lock_path = settings_path.parent / ".cozempic-init.lock"
         self._fh = None
 
     def __enter__(self):
+        import os as _os
         try:
-            import fcntl
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             # Append mode so two racing opens don't truncate each other; the
             # lock file content is irrelevant — we only use the fd for locking.
             self._fh = open(self.lock_path, "a")
-            # Use lockf (POSIX record locks) not flock: lockf works reliably
-            # over NFS, whereas flock on NFSv3 historically silent-no-ops
-            # (returns success without actually locking), which would let two
-            # init runs clobber each other on network homes.
-            fcntl.lockf(self._fh.fileno(), fcntl.LOCK_EX)
+            if _os.name == "nt":
+                # Windows — msvcrt.locking locks bytes from the current file
+                # position. "a" mode on a fresh/empty lock file leaves the
+                # pointer at byte 0, so this locks byte 0. Mirrors the
+                # _HostFileLock pattern in helpers.py.
+                import msvcrt
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                # POSIX — use lockf (record locks) not flock: lockf works
+                # reliably over NFS, whereas flock on NFSv3 historically
+                # silent-no-ops (returns success without actually locking),
+                # which would let two init runs clobber each other on
+                # network homes.
+                import fcntl
+                fcntl.lockf(self._fh.fileno(), fcntl.LOCK_EX)
         except ImportError:
-            # Windows — fcntl unavailable. Proceed without locking.
+            # Platform missing both fcntl AND msvcrt (extremely unusual —
+            # e.g. some embedded cpython builds). Degrade to unlocked; we
+            # lose the concurrency guarantee but don't crash.
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
             self._fh = None
         except OSError as exc:
             # Permission error (read-only .claude/), disk full, etc. Degrade to
             # unlocked but warn — silent skipping would hide real setup problems.
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
             self._fh = None
             sys.stderr.write(
                 f"  Cozempic: settings lock unavailable ({exc}); proceeding without concurrency guard.\n"
@@ -259,16 +284,28 @@ class _SettingsLock:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._fh is not None:
-            try:
+        if self._fh is None:
+            return
+        import os as _os
+        try:
+            if _os.name == "nt":
+                import msvcrt
+                # msvcrt.locking unlocks bytes from the current file
+                # position — seek back to byte 0 to match the lock site.
+                try:
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
                 import fcntl
                 fcntl.lockf(self._fh.fileno(), fcntl.LOCK_UN)
-            except (ImportError, OSError):
-                pass
-            try:
-                self._fh.close()
-            except OSError:
-                pass
+        except (ImportError, OSError):
+            pass
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
 
 def wire_hooks(project_dir: str) -> dict:
