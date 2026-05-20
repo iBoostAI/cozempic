@@ -159,7 +159,7 @@ def detect_context_window(messages: list[Message]) -> int:
     Priority:
     1. COZEMPIC_CONTEXT_WINDOW env var (user override)
     2. Model detection from session data (exact match, then prefix match)
-    3. DEFAULT_CONTEXT_WINDOW (200K)
+    3. DEFAULT_CONTEXT_WINDOW (1M)
 
     Handles model ID variants:
     - "claude-opus-4-6[1m]" → 1M (exact match)
@@ -413,58 +413,70 @@ def estimate_session_tokens(
 
 
 def quick_token_estimate(path: Path, context_window: int = DEFAULT_CONTEXT_WINDOW) -> int | None:
-    """Fast token estimate by reading only the tail of a JSONL file.
+    """Fast token estimate by reading the tail of a JSONL file.
 
-    Reads the tail and tries to extract usage from the last assistant
-    message. Tail buffer scales with context window: 50KB for 200K,
-    100KB for 1M (larger sessions have more tool results before the
-    last assistant message).
+    Extracts usage from the last main-chain assistant message. Starts with a
+    small tail (50KB for 200K, 100KB for 1M) and GROWS it — up to the whole
+    file — when no usage frame is found there. A long trailing run of
+    usage-less lines (streaming partials, attachments, queued operations) can
+    push the last real ``usage`` block past a fixed window; the old fixed-tail
+    read then returned None, blanking ``cozempic current`` AND disabling every
+    token-based guard threshold (each gated on ``current_tokens is not None``),
+    silently degrading the guard to MB-only thresholds on long sessions.
 
-    Returns the token total, or None if no usage data found.
+    Returns the token total, or None only when the file genuinely contains no
+    usage data anywhere (e.g. a brand-new or heuristic-only session).
     """
     try:
         file_size = path.stat().st_size
-        tail_kb = 100 if context_window >= 1_000_000 else 50
-        read_size = min(file_size, tail_kb * 1024)
+        base = (100 if context_window >= 1_000_000 else 50) * 1024
+        # Progressive tail sizes, always ending with the full file so a usage
+        # frame is found wherever it sits. Dedup keeps small files cheap.
+        sizes: list[int] = []
+        for candidate in (base, base * 8, base * 64, file_size):
+            s = min(candidate, file_size)
+            if s not in sizes:
+                sizes.append(s)
 
-        with open(path, "rb") as f:
+        for read_size in sizes:
+            with open(path, "rb") as f:
+                if file_size > read_size:
+                    f.seek(file_size - read_size)
+                raw = f.read().decode("utf-8", errors="replace")
+
+            lines = raw.strip().split("\n")
+            # The first line may be partial if we seeked into the middle.
             if file_size > read_size:
-                f.seek(file_size - read_size)
-            raw = f.read().decode("utf-8", errors="replace")
+                lines = lines[1:]
 
-        # Parse lines from the tail
-        lines = raw.strip().split("\n")
-        # The first line may be partial if we seeked, skip it
-        if file_size > read_size:
-            lines = lines[1:]
+            # Walk backwards looking for an assistant message with usage.
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-        # Walk backwards looking for an assistant message with usage
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                if get_msg_type(msg) != "assistant":
+                    continue
+                if msg.get("isSidechain"):
+                    continue
 
-            if get_msg_type(msg) != "assistant":
-                continue
-            if msg.get("isSidechain"):
-                continue
+                inner = msg.get("message", {})
+                if inner.get("model") == "<synthetic>":
+                    continue
+                usage = inner.get("usage")
+                if not usage or not isinstance(usage, dict):
+                    continue
 
-            inner = msg.get("message", {})
-            if inner.get("model") == "<synthetic>":
-                continue
-            usage = inner.get("usage")
-            if not usage or not isinstance(usage, dict):
-                continue
-
-            input_tok = usage.get("input_tokens", 0)
-            output_tok = usage.get("output_tokens", 0)
-            cache_create = usage.get("cache_creation_input_tokens", 0)
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            return input_tok + cache_create + cache_read + output_tok
+                input_tok = usage.get("input_tokens", 0)
+                output_tok = usage.get("output_tokens", 0)
+                cache_create = usage.get("cache_creation_input_tokens", 0)
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                return input_tok + cache_create + cache_read + output_tok
+            # No usage in this tail — grow to the next (larger) size and retry.
 
     except (OSError, UnicodeDecodeError):
         pass

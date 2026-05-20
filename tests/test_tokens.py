@@ -375,6 +375,36 @@ class TestQuickTokenEstimate(unittest.TestCase):
         result = quick_token_estimate(Path("/nonexistent/file.jsonl"))
         self.assertIsNone(result)
 
+    def test_grows_tail_to_find_usage_beyond_window(self):
+        # A usage frame buried behind a long trailing run of usage-less lines
+        # must still be found — otherwise the guard goes token-blind on long
+        # sessions (every threshold is gated on `current_tokens is not None`).
+        # Usage frame at the front; >100KB of usage-less filler follows it,
+        # past the 1M fixed tail.
+        messages = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "early"}],
+                    "usage": {
+                        "input_tokens": 1000, "output_tokens": 200,
+                        "cache_creation_input_tokens": 500, "cache_read_input_tokens": 300,
+                    },
+                },
+            },
+        ]
+        # ~2KB per filler line; 150 lines ≈ 300KB of usage-less tail (> 100KB).
+        for _ in range(150):
+            messages.append({"type": "user", "message": {"role": "user", "content": "x" * 2000}})
+        path = self._write_jsonl(messages)
+        try:
+            self.assertGreater(path.stat().st_size, 200 * 1024)
+            result = quick_token_estimate(path, context_window=1_000_000)
+            self.assertEqual(result, 2000)  # 1000 + 500 + 300 + 200(output)
+        finally:
+            path.unlink()
+
 
 class TestCalibratedHeuristicPath(unittest.TestCase):
     """Test that estimate_session_tokens() uses calibrate_ratio() in heuristic path."""
