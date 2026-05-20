@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from cozempic.helpers import msg_bytes
 from cozempic.tokens import (
+    CHARS_PER_TOKEN_DEFAULT,
     DEFAULT_CONTEXT_WINDOW,
     SYSTEM_OVERHEAD_TOKENS,
     TokenEstimate,
@@ -208,7 +210,7 @@ class TestHeuristicEstimation(unittest.TestCase):
 
     def test_basic_estimation(self):
         messages = [
-            make_user(0, "a" * 370),  # ~100 tokens at 3.7 chars/token
+            make_user(0, "a" * 370),  # ~120 tokens at the 3.1 chars/token default
             make_assistant_no_usage(1, "b" * 370),
         ]
         total, breakdown = estimate_tokens_heuristic(messages)
@@ -231,7 +233,7 @@ class TestHeuristicEstimation(unittest.TestCase):
         }
         messages = [make_message(0, msg)]
         total, _ = estimate_tokens_heuristic(messages)
-        # Should be much less than 10000/3.7 + overhead
+        # Thinking excluded → only "short answer" counts, far below overhead+100
         self.assertLess(total, SYSTEM_OVERHEAD_TOKENS + 100)
 
     def test_skips_progress_and_file_history(self):
@@ -377,6 +379,17 @@ class TestQuickTokenEstimate(unittest.TestCase):
 class TestCalibratedHeuristicPath(unittest.TestCase):
     """Test that estimate_session_tokens() uses calibrate_ratio() in heuristic path."""
 
+    def setUp(self):
+        # These tests assert exact heuristic totals against the default ratio.
+        # Isolate from a COZEMPIC_CHARS_PER_TOKEN override that may be set in the
+        # developer's shell (same env-leak class PR #95 fixed for the window).
+        self._saved_cpt = os.environ.pop("COZEMPIC_CHARS_PER_TOKEN", None)
+        self.addCleanup(self._restore_cpt)
+
+    def _restore_cpt(self):
+        if self._saved_cpt is not None:
+            os.environ["COZEMPIC_CHARS_PER_TOKEN"] = self._saved_cpt
+
     def test_calibrated_ratio_used_when_usage_and_content_available(self):
         """When exact usage exists but we force heuristic path,
         calibrate_ratio() should be used. We test indirectly: if the session
@@ -400,7 +413,7 @@ class TestCalibratedHeuristicPath(unittest.TestCase):
         te = estimate_session_tokens(messages)
         self.assertEqual(te.method, "heuristic")
         # No usage data → calibrate_ratio returns None → default ratio used
-        expected_tokens = int(14800 / 3.7) + SYSTEM_OVERHEAD_TOKENS
+        expected_tokens = int(14800 / CHARS_PER_TOKEN_DEFAULT) + SYSTEM_OVERHEAD_TOKENS
         self.assertEqual(te.total, expected_tokens)
 
     def test_fallback_to_default_ratio_when_no_usage(self):
@@ -413,16 +426,16 @@ class TestCalibratedHeuristicPath(unittest.TestCase):
         te = estimate_session_tokens(messages)
         self.assertEqual(te.method, "heuristic")
         self.assertEqual(te.confidence, "medium")
-        # Should use default 3.7 chars/token ratio
+        # Should use the default chars/token ratio
         total_chars = len("hello world") + len("greetings")
-        expected = int(total_chars / 3.7) + SYSTEM_OVERHEAD_TOKENS
+        expected = int(total_chars / CHARS_PER_TOKEN_DEFAULT) + SYSTEM_OVERHEAD_TOKENS
         self.assertEqual(te.total, expected)
 
 
 class TestCalibrateRatio(unittest.TestCase):
 
     def test_returns_ratio_with_usage(self):
-        text = "a" * 3700  # ~1000 tokens at 3.7 default
+        text = "a" * 3700  # exact ratio comes from usage below, not the default
         messages = [
             make_user(0, text),
             make_assistant_with_usage(
@@ -492,6 +505,48 @@ class TestEnvVarOverrideValidation(unittest.TestCase):
         from unittest.mock import patch
         with patch.dict(os.environ, {"COZEMPIC_SYSTEM_OVERHEAD_TOKENS": "-50"}):
             self.assertEqual(self._get_overhead(), SYSTEM_OVERHEAD_TOKENS)
+
+
+class TestCharsPerTokenOverride(unittest.TestCase):
+    """COZEMPIC_CHARS_PER_TOKEN override for the heuristic divisor."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("COZEMPIC_CHARS_PER_TOKEN", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.environ.pop("COZEMPIC_CHARS_PER_TOKEN", None)
+        if self._saved is not None:
+            os.environ["COZEMPIC_CHARS_PER_TOKEN"] = self._saved
+
+    def test_default_when_unset(self):
+        from cozempic.tokens import get_chars_per_token
+        self.assertEqual(get_chars_per_token(), CHARS_PER_TOKEN_DEFAULT)
+
+    def test_valid_override_honored(self):
+        from cozempic.tokens import get_chars_per_token
+        os.environ["COZEMPIC_CHARS_PER_TOKEN"] = "2.5"
+        self.assertEqual(get_chars_per_token(), 2.5)
+
+    def test_out_of_range_falls_back_to_default(self):
+        from cozempic.tokens import get_chars_per_token
+        for bad in ("99", "0", "0.5", "-3"):
+            os.environ["COZEMPIC_CHARS_PER_TOKEN"] = bad
+            self.assertEqual(get_chars_per_token(), CHARS_PER_TOKEN_DEFAULT, bad)
+
+    def test_garbage_falls_back_to_default(self):
+        from cozempic.tokens import get_chars_per_token
+        os.environ["COZEMPIC_CHARS_PER_TOKEN"] = "abc"
+        self.assertEqual(get_chars_per_token(), CHARS_PER_TOKEN_DEFAULT)
+
+    def test_override_changes_heuristic_total(self):
+        msgs = [make_user(0, "a" * 1000), make_assistant_no_usage(1, "")]
+        os.environ["COZEMPIC_CHARS_PER_TOKEN"] = "2.0"
+        total_dense, _ = estimate_tokens_heuristic(msgs)
+        os.environ["COZEMPIC_CHARS_PER_TOKEN"] = "4.0"
+        total_sparse, _ = estimate_tokens_heuristic(msgs)
+        # Smaller divisor → more tokens per char.
+        self.assertGreater(total_dense, total_sparse)
 
 
 if __name__ == "__main__":
