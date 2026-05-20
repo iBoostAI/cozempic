@@ -181,17 +181,21 @@ def treat_session(prescription: str = "standard", execute: bool = False) -> str:
     lines.append(f"Prescription: {prescription}")
 
     if pre_te.total and post_te.total:
-        from cozempic.tokens import DEFAULT_CONTEXT_WINDOW
         tok_saved = pre_te.total - post_te.total
         tok_pct = tok_saved / pre_te.total * 100 if pre_te.total > 0 else 0
-        after_pct = round(post_te.total / DEFAULT_CONTEXT_WINDOW * 100, 1)
+        # Use the session's DETECTED context window (1M for current models),
+        # not a hardcoded 200K. estimate_session_tokens already computed the
+        # percentage against the detected window.
+        after_pct = post_te.context_pct
+        cw = post_te.context_window
+        window_str = f"{cw // 1000}K" if cw < 1_000_000 else f"{cw / 1_000_000:.0f}M"
         pre_str = f"{pre_te.total / 1000:.1f}K" if pre_te.total >= 1000 else str(pre_te.total)
         post_str = f"{post_te.total / 1000:.1f}K" if post_te.total >= 1000 else str(post_te.total)
         tok_saved_str = f"{tok_saved / 1000:.1f}K" if tok_saved >= 1000 else str(tok_saved)
         lines.append(f"Before: {pre_str} tokens ({original_bytes / 1024:.1f}KB, {len(messages)} messages)")
         lines.append(f"After: {post_str} tokens ({final_bytes / 1024:.1f}KB, {len(new_messages)} messages)")
         lines.append(f"Freed: {tok_saved_str} tokens ({tok_pct:.1f}%) — {saved_bytes / 1024:.1f}KB")
-        lines.append(f"Context: {after_pct}% of 200K window")
+        lines.append(f"Context: {after_pct}% of {window_str} window")
     else:
         lines.append(f"Before: {original_bytes / 1024:.1f}KB ({len(messages)} messages)")
         lines.append(f"After: {final_bytes / 1024:.1f}KB ({len(new_messages)} messages)")

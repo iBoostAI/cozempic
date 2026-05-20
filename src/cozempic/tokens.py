@@ -8,6 +8,7 @@ Two methods:
 from __future__ import annotations
 
 import json
+import os
 from collections import namedtuple
 from pathlib import Path
 
@@ -99,10 +100,34 @@ def get_context_window_override() -> int | None:
     from ._validation import parse_env_positive_int
     return parse_env_positive_int("COZEMPIC_CONTEXT_WINDOW")
 
-# Chars-per-token defaults (conservative)
-CHARS_PER_TOKEN_CODE = 3.5
-CHARS_PER_TOKEN_PROSE = 4.0
-CHARS_PER_TOKEN_DEFAULT = 3.7  # blended default
+# Chars-per-token defaults, calibrated against live Claude Code JSONL.
+# Measured 3.08–3.27 chars/token on real sessions: JSON keys, UUIDs, tool
+# arguments and code are far denser than prose, so the old 3.7 blended default
+# undercounted the heuristic path by ~15-20%. These are used ONLY by the
+# heuristic fallback — sessions with a usage block use the exact recorded
+# count (input + cache_creation + cache_read + output), which is authoritative.
+CHARS_PER_TOKEN_CODE = 3.0
+CHARS_PER_TOKEN_PROSE = 3.5
+CHARS_PER_TOKEN_DEFAULT = 3.1  # blended default
+
+
+def get_chars_per_token() -> float:
+    """Resolve the heuristic chars-per-token divisor.
+
+    Honors the ``COZEMPIC_CHARS_PER_TOKEN`` env override (positive float,
+    clamped to a sane 1.0–20.0 range); otherwise returns the calibrated
+    default. Affects only the heuristic fallback — exact usage-based counts
+    ignore it entirely.
+    """
+    raw = os.environ.get("COZEMPIC_CHARS_PER_TOKEN")
+    if raw:
+        try:
+            val = float(raw)
+        except ValueError:
+            return CHARS_PER_TOKEN_DEFAULT
+        if 1.0 <= val <= 20.0:
+            return val
+    return CHARS_PER_TOKEN_DEFAULT
 
 TokenEstimate = namedtuple(
     "TokenEstimate", ["total", "context_pct", "method", "confidence", "model", "context_window"]
@@ -286,13 +311,16 @@ def _estimate_block_chars(block: dict) -> int:
 
 def estimate_tokens_heuristic(
     messages: list[Message],
-    chars_per_token: float = CHARS_PER_TOKEN_DEFAULT,
+    chars_per_token: float | None = None,
 ) -> tuple[int, dict[str, int]]:
     """Estimate tokens from content characters when no usage data exists.
 
     Returns (total_tokens, breakdown_by_type) where breakdown maps
-    message type to estimated token count.
+    message type to estimated token count. When ``chars_per_token`` is not
+    given, the calibrated default (env-overridable) is used.
     """
+    if chars_per_token is None:
+        chars_per_token = get_chars_per_token()
     total_chars = 0
     breakdown: dict[str, int] = {}
 
