@@ -269,6 +269,20 @@ class TestG4_PidfileWriteIsAtomic(unittest.TestCase):
         self.log_path.unlink(missing_ok=True)
         self.addCleanup(self.pid_path.unlink, missing_ok=True)
         self.addCleanup(self.log_path.unlink, missing_ok=True)
+        # PR #94 added a reload-sentinel gate to start_guard_daemon (returns
+        # "reload in flight" if a sentinel exists for this session). A sentinel
+        # leaked by another test's /tmp pollution would make both concurrent
+        # starts below report started=False. Isolate from sentinel state.
+        from cozempic.reload_lock import unlink_reload_sentinel
+
+        def _safe_unlink_sentinel():
+            try:
+                unlink_reload_sentinel(self.session_id)
+            except OSError:
+                pass
+
+        _safe_unlink_sentinel()
+        self.addCleanup(_safe_unlink_sentinel)
 
     def tearDown(self):
         import shutil

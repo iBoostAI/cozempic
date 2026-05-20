@@ -1274,6 +1274,20 @@ def _terminate_and_resume(
         print(f"  SSH session — skipping terminate+resume. Resume manually: {resume_cmd}")
         return
 
+    # Anti-resurrection + PID-reuse entry gate (restored from pre-#94 behaviour).
+    # If Claude is already gone at entry — e.g. the user exited during the prune
+    # window between the guard's liveness check and this call — do NOT proceed.
+    # The reload watcher resumes UNCONDITIONALLY once claude_pid dies
+    # (`while kill -0 …; do sleep; done; <resume_cmd>`), so entering here with a
+    # dead PID would reopen a session the user intentionally closed — the exact
+    # class of the cozempic reload incidents. The per-block checks below only
+    # guard each SIGTERM/SIGKILL, NOT the watcher spawn, so this entry gate is
+    # required for correctness. It also returns before any sentinel write,
+    # consistent with "sentinel only on paths that actually terminate+resume."
+    if not _is_claude_process(claude_pid, session_path=session_path):
+        print(f"  PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
+        return
+
     if term_env == "tmux":
         # tmux: graceful /exit via send-keys, then resume in same pane.
         # Verify PID identity before sending keyboard events (PID reuse guard).

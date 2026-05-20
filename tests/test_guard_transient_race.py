@@ -70,7 +70,13 @@ class TestReloadWritesInFlightSentinel(unittest.TestCase):
             # Record whether sentinel exists at the moment watcher is called
             sentinel_written_before_watcher.append(self.sentinel_path.exists())
 
+        # Claude must be alive — the sentinel only makes sense when we are
+        # actually terminating a live Claude and resuming it. _terminate_and_resume
+        # has an anti-resurrection entry gate (skips everything, incl. the
+        # sentinel write, if claude_pid is no longer a Claude process).
         with patch("cozempic.guard._spawn_reload_watcher", side_effect=_fake_watcher), \
+             patch("cozempic.guard._is_claude_process", return_value=True), \
+             patch("cozempic.guard._wait_for_exit", return_value=True), \
              patch("cozempic.guard.os.kill"), \
              patch("cozempic.guard.time.sleep"):
             from cozempic.guard import _terminate_and_resume
@@ -107,6 +113,38 @@ class TestReloadWritesInFlightSentinel(unittest.TestCase):
         # Rough ISO timestamp check (must parse without ValueError)
         from datetime import datetime
         datetime.fromisoformat(lines[1].strip())  # raises on bad format
+
+
+# ---------------------------------------------------------------------------
+# Anti-resurrection invariant — regression guard for the outer-check removal
+# ---------------------------------------------------------------------------
+class TestNoResurrectionWhenClaudeAlreadyDead(unittest.TestCase):
+    """If Claude is already gone when `_terminate_and_resume` is entered — e.g.
+    the user exited during the prune window between the guard's liveness check
+    and the reload — the function must NOT write a sentinel or spawn the resume
+    watcher. The watcher resumes UNCONDITIONALLY once claude_pid dies
+    (`while kill -0 …; do sleep; done; <resume_cmd>`), so without the entry gate
+    a dead PID reopens a session the user intentionally closed — the cozempic
+    reload-resurrection incident class. PR #94's per-block checks only guard the
+    SIGTERM, not the watcher spawn, so the entry gate is load-bearing here.
+    """
+
+    def test_dead_claude_at_entry_skips_sentinel_and_watcher(self):
+        sid = "ddddddddeeee1111222233334444dddd"
+        with patch("cozempic.guard._spawn_reload_watcher") as mock_watcher, \
+             patch("cozempic.guard.write_reload_sentinel") as mock_sentinel, \
+             patch("cozempic.guard._is_claude_process", return_value=False), \
+             patch("cozempic.guard._detect_terminal_env", return_value="plain"), \
+             patch("cozempic.guard.os.kill") as mock_kill:
+            from cozempic.guard import _terminate_and_resume
+            _terminate_and_resume(
+                claude_pid=99999,
+                project_dir="/tmp/fake_project",
+                session_id=sid,
+            )
+        mock_watcher.assert_not_called()   # no resurrection
+        mock_sentinel.assert_not_called()  # no stale sentinel suppressing legit spawns
+        mock_kill.assert_not_called()      # no signal to a dead/recycled PID
 
 
 # ---------------------------------------------------------------------------
