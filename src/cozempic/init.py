@@ -245,11 +245,17 @@ class _SettingsLock:
             # lock file content is irrelevant — we only use the fd for locking.
             self._fh = open(self.lock_path, "a")
             if _os.name == "nt":
-                # Windows — msvcrt.locking locks bytes from the current file
-                # position. "a" mode on a fresh/empty lock file leaves the
-                # pointer at byte 0, so this locks byte 0. Mirrors the
-                # _HostFileLock pattern in helpers.py.
+                # Windows — msvcrt.locking locks bytes from the CURRENT file
+                # position. "a" (append) mode on Windows leaves the pointer at
+                # EOF: byte 0 on a fresh empty lock file, but >0 if a stale
+                # non-empty lock file was left from a prior crashed run.
+                # __exit__ rewinds to byte 0 before LK_UNLCK, so without
+                # this matching seek(0) before LK_LOCK the two operations
+                # would target different byte ranges and silently fail to
+                # serialize. Mirrors the _HostFileLock pattern in helpers.py
+                # (which has the same defense-in-depth gap — separate fix).
                 import msvcrt
+                self._fh.seek(0)
                 msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
             else:
                 # POSIX — use lockf (record locks) not flock: lockf works

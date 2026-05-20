@@ -10,10 +10,13 @@ new behavior:
     Both missing → no-op fallback (no crash)
     OSError on real platform → warn + no-op (settings lock unavailable)
 
-Running on POSIX CI exercises the Windows branch via a `sys.modules`
-shim that fakes `msvcrt` with a per-byte locking model. The reverse —
-exercising the POSIX branch on Windows CI — is covered by the existing
-test_global_init.py suite that hits `wire_hooks` end-to-end.
+The four `test_windows_*` tests monkeypatch `os.name = "nt"` and inject
+a fake `msvcrt` into `sys.modules` so the Windows branch runs
+unconditionally regardless of host OS — on Windows the fake REPLACES
+the real `msvcrt` (we deliberately want to assert on the call shape,
+not exercise the real kernel lock). The POSIX branch is exercised by
+the two `test_posix_*` tests when host OS is POSIX, and by the existing
+`test_global_init.py` suite that hits `wire_hooks` end-to-end.
 """
 from __future__ import annotations
 
@@ -113,12 +116,14 @@ def test_windows_acquires_msvcrt_locking(monkeypatch, settings_path: Path) -> No
 
 
 def test_windows_seek_zero_before_unlock(monkeypatch, settings_path: Path) -> None:
-    """msvcrt.locking is position-relative — __exit__ must seek to 0 before LK_UNLCK.
+    """msvcrt.locking is position-relative — both __enter__ AND __exit__ must seek(0).
 
-    'a' (append) mode leaves the file pointer at end-of-file. For an
-    empty fresh lock file that's byte 0, but defense-in-depth: we MUST
-    seek(0) before unlocking. The test asserts seek is called with 0
-    before the LK_UNLCK call.
+    'a' (append) mode leaves the file pointer at end-of-file. For a fresh
+    empty lock file EOF==0, but for a stale non-empty lock file from a
+    prior crashed run, EOF>0. Without seek(0) before BOTH LK_LOCK (acquire)
+    AND LK_UNLCK (release), the two operations target different byte
+    ranges and silently fail to serialize. The test asserts seek(0) is
+    called at least twice — once around acquire, once around release.
     """
     fake = _FakeMsvcrt()
     _force_windows_mode(monkeypatch, fake)
@@ -143,12 +148,72 @@ def test_windows_seek_zero_before_unlock(monkeypatch, settings_path: Path) -> No
     with _SettingsLock(settings_path):
         pass
 
-    # seek(0) must have been called between the lock and unlock calls.
-    assert 0 in seeks, f"seek(0) not invoked; saw seeks={seeks}"
+    # seek(0) must have been called at least twice: once before LK_LOCK
+    # (defense-in-depth for stale non-empty lock files), once before
+    # LK_UNLCK. If either is missing, the lock/release pair targets
+    # different byte positions on non-empty lock files.
+    assert seeks.count(0) >= 2, (
+        f"expected at least 2 seek(0) calls (before LK_LOCK and before LK_UNLCK), "
+        f"got seeks={seeks}"
+    )
+
+
+def test_windows_acquire_position_normalized_on_stale_lock_file(monkeypatch, settings_path: Path) -> None:
+    """Regression test for the stale-non-empty-lock-file case: the byte locked
+    by LK_LOCK MUST equal the byte unlocked by LK_UNLCK (both byte 0).
+
+    Reproducer: pre-populate the lock file with content so EOF > 0. Without
+    seek(0) before LK_LOCK, the lock would land at byte EOF while the
+    unlock would target byte 0 — different ranges, no mutual exclusion.
+    Asserted by recording the file position at each msvcrt.locking call.
+    """
+    # Pre-populate the lock file so EOF > 0.
+    lock_path = settings_path.parent / ".cozempic-init.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("stale content from prior crashed run\n")
+    assert lock_path.stat().st_size > 0
+
+    # Capture the file position at the moment each msvcrt.locking call fires.
+    position_at_call: list = []
+    captured_fh: list = []
+
+    fake = _FakeMsvcrt()
+    original_locking = fake.locking
+
+    def position_aware_locking(fd, mode, nbytes):
+        # captured_fh[0] is the file handle opened by _SettingsLock
+        if captured_fh:
+            position_at_call.append((mode, captured_fh[0].tell()))
+        return original_locking(fd, mode, nbytes)
+
+    fake.locking = position_aware_locking
+    _force_windows_mode(monkeypatch, fake)
+
+    original_open = open
+
+    def capturing_open(path, *args, **kwargs):
+        fh = original_open(path, *args, **kwargs)
+        captured_fh.append(fh)
+        return fh
+
+    monkeypatch.setattr("builtins.open", capturing_open)
+
+    with _SettingsLock(settings_path):
+        pass
+
+    # Both LK_LOCK and LK_UNLCK must have fired at position 0 — anything
+    # else means the seek(0) before-LK_LOCK or before-LK_UNLCK is missing.
+    assert len(position_at_call) == 2, f"expected 2 locking calls, got {position_at_call}"
+    lock_mode, lock_pos = position_at_call[0]
+    unlock_mode, unlock_pos = position_at_call[1]
+    assert lock_mode == _FakeMsvcrt.LK_LOCK
+    assert unlock_mode == _FakeMsvcrt.LK_UNLCK
+    assert lock_pos == 0, f"LK_LOCK fired at byte {lock_pos}, expected 0 (stale file case)"
+    assert unlock_pos == 0, f"LK_UNLCK fired at byte {unlock_pos}, expected 0"
 
 
 def test_windows_oserror_during_lock_warns_and_degrades(monkeypatch, capsys, settings_path: Path) -> None:
-    """OSError from msvcrt.locking degrades to no-op + stderr warning, no crash."""
+    """OSError from msvcrt.locking degrades to no-op + stderr warning + fh close."""
     fake = _FakeMsvcrt()
 
     def raising_locking(fd, mode, nbytes):
@@ -161,11 +226,28 @@ def test_windows_oserror_during_lock_warns_and_degrades(monkeypatch, capsys, set
     stderr_buf = io.StringIO()
     monkeypatch.setattr(sys, "stderr", stderr_buf)
 
+    # Capture the file handle that was opened-then-abandoned by the OSError
+    # cleanup path, so we can assert it was closed (no fd leak).
+    opened_handles: list = []
+    original_open = open
+
+    def tracking_open(path, *args, **kwargs):
+        fh = original_open(path, *args, **kwargs)
+        opened_handles.append(fh)
+        return fh
+
+    monkeypatch.setattr("builtins.open", tracking_open)
+
     with _SettingsLock(settings_path) as lock:
         # _fh should be None — degraded path
         assert lock._fh is None
 
     assert "settings lock unavailable" in stderr_buf.getvalue()
+    # The file handle that was opened before msvcrt.locking failed MUST have
+    # been closed by the OSError cleanup branch — otherwise the fd leaks
+    # every time a settings lock acquisition fails (read-only mount, etc.).
+    assert opened_handles, "expected open() to have been called"
+    assert opened_handles[0].closed, "fd leak: opened lock file was not closed on OSError"
 
 
 # ─── Missing-both fallback (neither fcntl nor msvcrt) ────────────────────────
