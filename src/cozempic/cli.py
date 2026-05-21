@@ -855,7 +855,9 @@ def cmd_doctor(args):
         print(f"    {icon} {r.name:<25} [{r.status.upper()}]")
         print(f"      {r.message}")
         if r.fix_description and r.status not in ("ok", "fixed"):
-            print(f"      Fix: {r.fix_description}")
+            fix_prefix = "      Fix: "
+            fix_text = r.fix_description.replace("\n", f"\n{' ' * len(fix_prefix)}")
+            print(f"{fix_prefix}{fix_text}")
         print()
 
         if r.status == "issue":
